@@ -413,7 +413,7 @@ class PlanCanvas(QWidget):
             ("apt_type",     "🏠  Apt Type",    "Click vertices around one apartment's footprint. Close near first vertex or double-click."),
             ("vertex_edit",  "✏  Edit Verts",  "Click polygon → drag yellow handles  |  Ctrl+Click edge → add vertex  |  Alt+Click vertex → delete"),
             ("balcony_cam",  "📷  Balcony Cam", "Two-click: position then aim. Click on existing cam to remove. Multiple cams per polygon supported."),
-            ("spring_arm",   "🎥  Spring Arm",  "Click inside a polygon to place its spring-arm camera. Arm always aims at the polygon centre; length = distance; pitch per-polygon (double-click the cam to edit) or via the default slider."),
+            ("spring_arm",   "🎥  Spring Arm",  "Click OUTSIDE a polygon — the cam binds to the nearest polygon and the arm aims back at its centre. Click length = arm length. Click an existing cam to move it; double-click to edit pitch; Delete to remove. Default pitch in the toolbar applies unless overridden per-polygon."),
         ]:
             a = _act(icon, lambda _, m=mode: self._set_mode(m),
                      tip, checkable=True)
@@ -555,7 +555,7 @@ class PlanCanvas(QWidget):
             "apt_type":    "Click vertices around one apartment's footprint. Close near first vertex or double-click.",
             "vertex_edit": "Click polygon → drag yellow handles to reshape  |  Ctrl+Click edge → add vertex  |  Alt+Click vertex → delete",
             "georef":      "Click a real-world landmark on the plan, then paste its UE Location in the popup.  Add 2+ landmarks and press Compute → Apply in the panel.",
-            "spring_arm":  "🎥  Click inside a polygon to place its spring-arm cam. Click an existing cam to move it, double-click to edit pitch, Delete to remove.",
+            "spring_arm":  "🎥  Click OUTSIDE a polygon to place its spring-arm cam (binds to the nearest polygon). Click an existing cam to move it, double-click to edit pitch, Delete to remove.",
         }
         self._set_status(hints.get(mode, ""))
 
@@ -888,31 +888,22 @@ class PlanCanvas(QWidget):
                 f"— now click to set camera orientation (ESC to cancel)")
 
         elif mode == "spring_arm":
-            # Single-click placement. If the click falls on an existing
-            # spring-arm marker we treat that as "pick up & drop here":
-            # the cam for THAT polygon moves to the current cursor. If the
-            # click lands inside a polygon (and not on a cam), we place /
-            # replace that polygon's spring-arm cam. Otherwise fall back
-            # to the nearest polygon by centroid, mirroring balcony cam
-            # UX for consistency.
+            # Single-click placement. The spring-arm cam is meant to sit
+            # *outside* the polygon, looking back at its centre — so we
+            # always bind to the NEAREST apartment polygon by centroid and
+            # drop the cam wherever the user clicked (inside or outside
+            # any polygon). Exception: clicking on an existing cam marker
+            # is "pick up & drop here" for THAT cam's own polygon, so the
+            # user can reposition without re-binding.
             _hit_sa = self._hit_test_spring_arm(pos)
             if _hit_sa is not None:
-                # Clicking on an existing cam while still inside its own
-                # polygon → move it within the polygon. Clicking a cam
-                # when a *different* polygon is under the cursor also
-                # just moves the original (user expressing "move this
-                # cam to here"), which is rare but harmless.
                 self._set_spring_arm(_hit_sa, pos)
                 return
-            _kind, _idx = self._hit_test_polygon(pos)
-            if _kind == "apt_type" and _idx is not None:
-                _target = _idx
-            else:
-                _target = self._nearest_apt_type_idx(pos)
-                if _target is None:
-                    self._set_status(
-                        "🎥  No apartment polygons — create one first.")
-                    return
+            _target = self._nearest_apt_type_idx(pos)
+            if _target is None:
+                self._set_status(
+                    "🎥  No apartment polygons — create one first.")
+                return
             self._set_spring_arm(_target, pos)
 
         elif mode == "vertex_edit":
