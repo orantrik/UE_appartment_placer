@@ -919,9 +919,24 @@ def _spawn_one_poi(apt):
         _tame_viewer(_existing)
 
     # ── Set PorchPawnArrow location/rotation for each placed balcony cam ─
-    # Cam #1 reuses the BP's existing PorchPawnArrow; cam #2+ are
-    # created via Actor.AddComponentByClass (called through reflection
-    # since the Python wrapper does not expose it directly).
+    # Cam #1 reuses the BP's existing PorchPawnArrow (SCS-persistent, stays
+    # attached to root through editor moves).
+    # Cam #2+ are created via Actor.AddComponentByClass with an explicit
+    # manual_attachment + register_component + attach_to_component sequence
+    # so they survive editor moves that re-run the Construction Script.
+    # The component is attached to the actor's root via KEEP_RELATIVE rules
+    # and positioned with set_relative_location/rotation so its transform
+    # follows the actor when the user drags the BP in the viewport.
+    #
+    # PLACEMENT MODEL (important — see generator history):
+    #   - Actor spawns with Rotator(0,0,0), so relative_yaw == world_yaw.
+    #   - Cam world target: (_pcx, _pcy, _z + _pcz)
+    #   - Actor world origin: (_ox, _oy, _z)
+    #   - Cam relative to root: (_pcx-_ox, _pcy-_oy, _pcz)
+    # We never layer transforms: create with IDENTITY, attach with
+    # KEEP_RELATIVE, then set relative ONCE. Re-fetching the component via
+    # the name diff is preserved because the C++ AddComponentByClass return
+    # value does not always round-trip cleanly through reflection.
     if _pcams and _actor:
         _cam_class = None
         try:
@@ -933,53 +948,123 @@ def _spawn_one_poi(apt):
             _cam_class = getattr(unreal, 'BalconyViewArrowComponent', None)
         if _cam_class is None:
             _cam_class = unreal.ArrowComponent
+        _root = None
+        try:
+            _root = _actor.root_component
+        except Exception:
+            pass
+        if _root is None:
+            try:
+                _root = _actor.get_editor_property("RootComponent")
+            except Exception:
+                _root = None
         for _ci, _t in enumerate(_pcams):
             _pcx, _pcy, _pcz = _t[0], _t[1], _t[2]
             _pyaw = _t[3] if len(_t) >= 4 else 0.0
             if _ci == 0:
+                # Cam #1: the BP's existing PorchPawnArrow. Already SCS-
+                # attached to root — use world setters (these recompute its
+                # RelativeLocation against the current actor transform, so
+                # the cam still follows the actor on later editor moves).
                 _comp = _existing
-            else:
+                if _comp is None:
+                    print(f"  WARN: no component for cam #{{_ci + 1}}")
+                    continue
+                _comp.set_world_location(
+                    unreal.Vector(_pcx, _pcy, _z + _pcz), False, False)
+                _comp.set_world_rotation(
+                    unreal.Rotator(0.0, 0.0, _pyaw), False, False)
+                _tame_viewer(_comp)
+                print(f"  Cam #1 "
+                      f"({{_pcx:.1f}}, {{_pcy:.1f}}, {{_z + _pcz:.1f}}) "
+                      f"yaw={{_pyaw}} [SCS:world]")
+                continue
+
+            # Cam #2+: create, register, attach, then set relative.
+            _comp = None
+            try:
+                _actor.modify()
+                _names_before = set(
+                    c.get_name() for c in
+                    _actor.get_components_by_class(unreal.ArrowComponent))
+                # manual_attachment=True so UE doesn't auto-attach to an
+                # unspecified parent; identity transform so the later
+                # set_relative_* is the single source of truth.
+                _actor.call_method(
+                    'AddComponentByClass',
+                    args=(_cam_class, True, unreal.Transform(), False))
+                for _a in _actor.get_components_by_class(
+                        unreal.ArrowComponent):
+                    if _a.get_name() not in _names_before:
+                        _comp = _a
+                        break
+                if _comp is not None:
+                    print(f"  +{{_comp.get_name()}} "
+                          f"class={{_comp.get_class().get_name()}}")
+                else:
+                    # M4: previously swallowed silently. The Python wrapper
+                    # does not surface AddComponentByClass failures as
+                    # exceptions, so we detect the no-new-component case by
+                    # diffing ArrowComponent names and warn explicitly.
+                    print(f"  WARN: AddComponentByClass returned no new "
+                          f"component for apt {{apt['apt_id']}} cam "
+                          f"#{{_ci + 1}} — is {{POI_BLUEPRINT_PATH}} a "
+                          f"compatible BP with reflected AddComponentByClass?")
+            except Exception as _aex:
+                print(f"  WARN: create component for apt "
+                      f"{{apt['apt_id']}} cam #{{_ci + 1}}: {{_aex}}")
                 _comp = None
-                try:
-                    _actor.modify()
-                    _names_before = set(
-                        c.get_name() for c in
-                        _actor.get_components_by_class(unreal.ArrowComponent))
-                    _actor.call_method(
-                        'AddComponentByClass',
-                        args=(_cam_class, False, unreal.Transform(), False))
-                    for _a in _actor.get_components_by_class(
-                            unreal.ArrowComponent):
-                        if _a.get_name() not in _names_before:
-                            _comp = _a
-                            break
-                    if _comp is not None:
-                        print(f"  +{{_comp.get_name()}} "
-                              f"class={{_comp.get_class().get_name()}}")
-                    else:
-                        # M4: previously swallowed silently. The Python wrapper
-                        # does not surface AddComponentByClass failures as
-                        # exceptions, so we detect the no-new-component case by
-                        # diffing ArrowComponent names and warn explicitly.
-                        print(f"  WARN: AddComponentByClass returned no new "
-                              f"component for apt {{apt['apt_id']}} cam "
-                              f"#{{_ci + 1}} — is {{POI_BLUEPRINT_PATH}} a "
-                              f"compatible BP with reflected AddComponentByClass?")
-                except Exception as _aex:
-                    print(f"  WARN: create component for apt "
-                          f"{{apt['apt_id']}} cam #{{_ci + 1}}: {{_aex}}")
-                    _comp = None
             if _comp is None:
                 print(f"  WARN: no component for cam #{{_ci + 1}}")
                 continue
-            _wloc = unreal.Vector(_pcx, _pcy, _z + _pcz)
-            _wrot = unreal.Rotator(0.0, 0.0, _pyaw)
-            _comp.set_world_location(_wloc, False, False)
-            _comp.set_world_rotation(_wrot, False, False)
+
+            # Register + attach — order matters: register FIRST so the
+            # component has a registered SceneComponent identity, then
+            # attach to the actor root with KEEP_RELATIVE so our upcoming
+            # set_relative_* call is what defines the final position.
+            try:
+                _comp.register_component()
+            except Exception as _rex:
+                # Already registered paths raise "already registered" in
+                # some UE versions — that's the state we want, so swallow
+                # only that case by warning and continuing.
+                print(f"  NOTE: register_component on cam #{{_ci + 1}} "
+                      f"({{_rex}}) — continuing")
+            if _root is not None:
+                try:
+                    _comp.attach_to_component(
+                        _root,
+                        "",  # socket name
+                        unreal.AttachmentRule.KEEP_RELATIVE,
+                        unreal.AttachmentRule.KEEP_RELATIVE,
+                        unreal.AttachmentRule.KEEP_RELATIVE,
+                        False)
+                except Exception as _atex:
+                    # Fallback: older unreal Python builds use a 5-arg
+                    # signature without the socket name.
+                    try:
+                        _comp.attach_to_component(
+                            _root,
+                            unreal.AttachmentRule.KEEP_RELATIVE,
+                            unreal.AttachmentRule.KEEP_RELATIVE,
+                            unreal.AttachmentRule.KEEP_RELATIVE,
+                            False)
+                    except Exception as _atex2:
+                        print(f"  WARN: attach_to_component failed on "
+                              f"cam #{{_ci + 1}}: {{_atex}} / {{_atex2}}")
+            else:
+                print(f"  WARN: no root component for apt "
+                      f"{{apt['apt_id']}} — cam #{{_ci + 1}} will not "
+                      f"follow actor on move")
+
+            _rel_loc = unreal.Vector(_pcx - _ox, _pcy - _oy, _pcz)
+            _rel_rot = unreal.Rotator(0.0, 0.0, _pyaw)
+            _comp.set_relative_location(_rel_loc, False, False)
+            _comp.set_relative_rotation(_rel_rot, False, False)
             _tame_viewer(_comp)
             print(f"  Cam #{{_ci + 1}} "
-                  f"({{_pcx:.1f}}, {{_pcy:.1f}}, {{_z + _pcz:.1f}}) "
-                  f"yaw={{_pyaw}}")
+                  f"rel({{_rel_loc.x:.1f}}, {{_rel_loc.y:.1f}}, "
+                  f"{{_rel_loc.z:.1f}}) yaw={{_pyaw}} [attached:relative]")
 {folder_code}    _spawned += 1
 
 for _bidx in range(0, len(APARTMENTS), _BATCH_SIZE):
@@ -1018,6 +1103,276 @@ if DESTROY_PORCH_CAMS_POST_SPAWN:
 # ── Assemble full templates ───────────────────────────────────────────────
 _VOLUMES_TEMPLATE     = _VOLUMES_HEADER     + _STATIC_MESH_SPAWN_LOOP + _VOLUMES_FOOTER
 _POI_VOLUMES_TEMPLATE = _VOLUMES_HEADER_POI + _POI_SPAWN_LOOP         + _VOLUMES_FOOTER
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Refresh balcony-cams utility — ships next to spawn_volumes.py so users
+# can restore cam #2+ on BP_POI actors after an editor move wipes them
+# (Construction Script rerun destroys instance-added components).
+#
+# Safe to run multiple times: actors that already have the right number
+# of extra arrows are skipped. Cam #1 (SCS PorchPawnArrow) is never
+# touched. Matches the robust attach pipeline from the main spawn loop:
+#   AddComponentByClass(manual_attachment=True, identity)
+#   → register_component()
+#   → attach_to_component(root, KEEP_RELATIVE × 3)
+#   → set_relative_location / set_relative_rotation
+# ──────────────────────────────────────────────────────────────────────────
+_REFRESH_CAMS_TEMPLATE = '''\
+"""refresh_balcony_cams.py — UE editor utility
+
+Run this in Unreal Engine AFTER you've moved/fine-tuned BP_POI actors in
+the editor and some balcony cameras (#2+) have disappeared. Cam #1
+(the Blueprint's SCS PorchPawnArrow) is SCS-persistent and never lost,
+so this script never recreates it.
+
+Usage:
+  1. Drop this file next to spawn_volumes.py (same folder).
+  2. In UE: Tools → Python → Execute Python Script… → pick this file.
+     (Or run `py refresh_balcony_cams.py` from the UE Python console.)
+
+What it does:
+  • Scans the current level for BP_POI actors.
+  • Identifies each actor by its label (format '<apt_id>_<floor>').
+  • Looks up the baked PORCH_CAM_INFO for that apartment type.
+  • If the actor is missing one or more of cam #2..N, wipes any partial
+    survivors and recreates the full cam #2..N set with the same robust
+    manual_attachment + register + attach_to_component pipeline the
+    main spawn script uses, so future editor moves won't wipe them.
+  • Batched (100 actors per ScopedEditorTransaction) to avoid Mass-LOD
+    ClientIndex overflow.
+
+Idempotent: actors with the correct cam count are skipped.
+"""
+
+import os, unreal
+
+FLOOR_HEIGHT_CM = {floor_cm}
+Z_BY_FLOOR_CM = {z_by_floor}
+
+{common_preamble}
+
+POI_BLUEPRINT_PATH = {poi_bp_path!r}
+if not POI_BLUEPRINT_PATH.endswith("_C"):
+    POI_BLUEPRINT_PATH += "_C"
+
+APT_TYPE_MESH_INFO = {apt_type_mesh_info}
+
+APARTMENTS = {apartments}
+
+PORCH_CAM_INFO = {porch_cam_info}
+
+# (apt_id str, floor int) → (building, entrance, type)
+_APT_LOOKUP = {{
+    (str(_a["apt_id"]), int(_a["floor"])): (
+        _a["building"], _a["entrance"], _a.get("type", ""))
+    for _a in APARTMENTS
+}}
+
+def _get_cam_class():
+    try:
+        _cc = unreal.load_class(
+            None, "/Script/SimplexUtils.BalconyViewArrowComponent")
+        if _cc is not None:
+            return _cc
+    except Exception:
+        pass
+    _cc = getattr(unreal, 'BalconyViewArrowComponent', None)
+    if _cc is None:
+        _cc = unreal.ArrowComponent
+    return _cc
+
+_cam_class = _get_cam_class()
+_poi_class = unreal.load_class(None, POI_BLUEPRINT_PATH)
+if _poi_class is None:
+    raise RuntimeError(f"POI Blueprint not found: {{POI_BLUEPRINT_PATH}}")
+
+try:
+    _actor_sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    _all_actors = _actor_sub.get_all_level_actors()
+except Exception:
+    _all_actors = unreal.EditorLevelLibrary.get_all_level_actors()
+
+# only keep actors that are the POI BP or a child class of it
+_target_actors = []
+for _a in _all_actors:
+    if _a is None:
+        continue
+    try:
+        _cls = _a.get_class()
+    except Exception:
+        continue
+    try:
+        if _cls is _poi_class or _cls.is_child_of(_poi_class):
+            _target_actors.append(_a)
+    except Exception:
+        continue
+
+print(f"[refresh_balcony_cams] scanning {{len(_target_actors)}} BP_POI actor(s)...")
+
+_processed = 0
+_restored = 0
+_already_ok = 0
+_unknown_label = 0
+_no_extras_configured = 0
+
+def _parse_label(_label):
+    """'<apt_id>_<floor>' -> (apt_id_str, floor_int) or None."""
+    if not _label or "_" not in _label:
+        return None
+    _apt_id, _, _floor_str = _label.rpartition("_")
+    try:
+        _f = int(_floor_str)
+    except ValueError:
+        return None
+    return _apt_id, _f
+
+def _process_actor(_actor):
+    global _processed, _restored, _already_ok, _unknown_label
+    global _no_extras_configured
+    try:
+        _label = _actor.get_actor_label()
+    except Exception:
+        _unknown_label += 1
+        return
+    _parsed = _parse_label(_label)
+    if _parsed is None:
+        _unknown_label += 1
+        return
+    _apt_id, _floor = _parsed
+    _key = _APT_LOOKUP.get((_apt_id, _floor))
+    if _key is None:
+        _unknown_label += 1
+        return
+
+    _pcam_raw = PORCH_CAM_INFO.get(_key)
+    if not _pcam_raw:
+        _no_extras_configured += 1
+        return
+    if isinstance(_pcam_raw, tuple):
+        _pcams = [_pcam_raw]
+    elif isinstance(_pcam_raw, list):
+        _pcams = list(_pcam_raw)
+    else:
+        _no_extras_configured += 1
+        return
+    if len(_pcams) <= 1:
+        _no_extras_configured += 1
+        return  # only cam #1 configured; SCS arrow handles it
+
+    _processed += 1
+    try:
+        _existing_arrows = list(
+            _actor.get_components_by_class(unreal.ArrowComponent))
+    except Exception:
+        _existing_arrows = []
+    _extras = [c for c in _existing_arrows
+               if c.get_name() != "PorchPawnArrow"]
+    _expected_extra = len(_pcams) - 1
+    if len(_extras) >= _expected_extra:
+        _already_ok += 1
+        return
+
+    # Wipe any partial survivors — matching a stale extra arrow to a
+    # specific cam config entry is guesswork, so we recreate cam #2..N
+    # from a clean slate. Cam #1 (PorchPawnArrow) is left alone.
+    for _c in _extras:
+        try:
+            _c.destroy_component()
+        except Exception as _dex:
+            print(f"  NOTE: {{_label}}: could not destroy stale "
+                  f"{{_c.get_name()}}: {{_dex}}")
+
+    _mesh_info = APT_TYPE_MESH_INFO.get(_key)
+    if _mesh_info is None:
+        print(f"  WARN: {{_label}}: no mesh info for key {{_key}}; "
+              f"can't compute relative origin, skipping")
+        return
+    _ox, _oy, _ap, _col = _mesh_info
+
+    _root = None
+    try:
+        _root = _actor.root_component
+    except Exception:
+        try:
+            _root = _actor.get_editor_property("RootComponent")
+        except Exception:
+            _root = None
+
+    _actor.modify()
+    for _ci, _t in enumerate(_pcams[1:], start=2):
+        _pcx, _pcy, _pcz = _t[0], _t[1], _t[2]
+        _pyaw = _t[3] if len(_t) >= 4 else 0.0
+        _names_before = set(
+            c.get_name() for c in
+            _actor.get_components_by_class(unreal.ArrowComponent))
+        try:
+            _actor.call_method(
+                'AddComponentByClass',
+                args=(_cam_class, True, unreal.Transform(), False))
+        except Exception as _aex:
+            print(f"  WARN: {{_label}}: AddComponentByClass cam "
+                  f"#{{_ci}}: {{_aex}}")
+            continue
+        _comp = None
+        for _a in _actor.get_components_by_class(unreal.ArrowComponent):
+            if _a.get_name() not in _names_before:
+                _comp = _a
+                break
+        if _comp is None:
+            print(f"  WARN: {{_label}}: no new arrow for cam #{{_ci}}")
+            continue
+        try:
+            _comp.register_component()
+        except Exception as _rex:
+            print(f"  NOTE: {{_label}}: register cam #{{_ci}}: {{_rex}}")
+        if _root is not None:
+            try:
+                _comp.attach_to_component(
+                    _root, "",
+                    unreal.AttachmentRule.KEEP_RELATIVE,
+                    unreal.AttachmentRule.KEEP_RELATIVE,
+                    unreal.AttachmentRule.KEEP_RELATIVE,
+                    False)
+            except Exception:
+                try:
+                    _comp.attach_to_component(
+                        _root,
+                        unreal.AttachmentRule.KEEP_RELATIVE,
+                        unreal.AttachmentRule.KEEP_RELATIVE,
+                        unreal.AttachmentRule.KEEP_RELATIVE,
+                        False)
+                except Exception as _atex:
+                    print(f"  WARN: {{_label}}: attach_to_component cam "
+                          f"#{{_ci}} failed: {{_atex}}")
+        _rel = unreal.Vector(_pcx - _ox, _pcy - _oy, _pcz)
+        _comp.set_relative_location(_rel, False, False)
+        _comp.set_relative_rotation(
+            unreal.Rotator(0.0, 0.0, _pyaw), False, False)
+        _restored += 1
+        print(f"  {{_label}}: +{{_comp.get_name()}} cam #{{_ci}} "
+              f"rel=({{_rel.x:.1f}}, {{_rel.y:.1f}}, {{_rel.z:.1f}}) "
+              f"yaw={{_pyaw}}")
+
+_BATCH = 100
+for _bi in range(0, len(_target_actors), _BATCH):
+    _batch = _target_actors[_bi:_bi + _BATCH]
+    _tlabel = f"Refresh porch cams [{{_bi + 1}}-{{_bi + len(_batch)}}]"
+    with unreal.ScopedEditorTransaction(_tlabel) as _trans:
+        for _actor in _batch:
+            _process_actor(_actor)
+    print(f"  [batch {{_bi // _BATCH + 1}}: processed={{_processed}} "
+          f"restored={{_restored}}]")
+
+print(
+    f"\\n[OK] Refresh complete. "
+    f"Scanned={{len(_target_actors)}} "
+    f"NeededRefresh={{_processed}} "
+    f"Restored={{_restored}} "
+    f"AlreadyOK={{_already_ok}} "
+    f"NoExtrasConfigured={{_no_extras_configured}} "
+    f"UnknownLabel={{_unknown_label}}")
+'''
 
 
 _SCRIPT_TEMPLATE = '''\
@@ -1277,6 +1632,18 @@ def generate_volumes(
             apt_type_mesh_info=apt_type_info_str,
             apartments=_fmt_apartments(apts),
             folder_code=folder_code,
+            poi_bp_path=poi_bp_path,
+            porch_cam_info=porch_cam_info_str,
+        )
+        # Ship the refresh utility alongside spawn_volumes.py so the user
+        # can restore cam #2+ if a BP_POI move in the editor ever wipes
+        # them (Construction Script rerun destroys instance-added comps).
+        obj_files["refresh_balcony_cams.py"] = _REFRESH_CAMS_TEMPLATE.format(
+            floor_cm=data.floor_height_cm,
+            z_by_floor=z_by_floor_str,
+            common_preamble=_COMMON_PREAMBLE,
+            apt_type_mesh_info=apt_type_info_str,
+            apartments=_fmt_apartments(apts),
             poi_bp_path=poi_bp_path,
             porch_cam_info=porch_cam_info_str,
         )
