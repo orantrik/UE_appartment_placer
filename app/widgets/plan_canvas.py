@@ -890,19 +890,27 @@ class PlanCanvas(QWidget):
         elif mode == "spring_arm":
             # Single-click placement. The spring-arm cam is meant to sit
             # *outside* the polygon, looking back at its centre — so we
-            # always bind to the NEAREST apartment polygon by centroid and
-            # drop the cam wherever the user clicked (inside or outside
-            # any polygon). Exception: clicking on an existing cam marker
-            # is "pick up & drop here" for THAT cam's own polygon, so the
-            # user can reposition without re-binding.
+            # always bind to the NEAREST VISIBLE apartment polygon by
+            # centroid and drop the cam wherever the user clicked (inside
+            # or outside any polygon). Exception: clicking on an existing
+            # cam marker is "pick up & drop here" for THAT cam's own
+            # polygon, so the user can reposition without re-binding.
             _hit_sa = self._hit_test_spring_arm(pos)
             if _hit_sa is not None:
                 self._set_spring_arm(_hit_sa, pos)
                 return
-            _target = self._nearest_apt_type_idx(pos)
+            _target = self._nearest_apt_type_idx(pos, visible_only=True)
             if _target is None:
-                self._set_status(
-                    "🎥  No apartment polygons — create one first.")
+                # Distinguish "no polygons at all" from "all hidden" so the
+                # user understands why the click is a no-op.
+                if self.apt_type_polygons:
+                    self._set_status(
+                        "🎥  Every apartment polygon is hidden — "
+                        "toggle at least one back on in the Layers panel "
+                        "to place a spring-arm cam.")
+                else:
+                    self._set_status(
+                        "🎥  No apartment polygons — create one first.")
                 return
             self._set_spring_arm(_target, pos)
 
@@ -1662,12 +1670,24 @@ class PlanCanvas(QWidget):
                 best_i, best_d = ai, d
         return best_i
 
-    def _nearest_apt_type_idx(self, pos: QPointF) -> int | None:
-        """Return idx of nearest apt_type polygon (by centroid distance), or None."""
+    def _nearest_apt_type_idx(
+        self, pos: QPointF, *, visible_only: bool = False,
+    ) -> int | None:
+        """Return idx of nearest apt_type polygon (by centroid distance), or None.
+
+        When ``visible_only`` is True, polygons hidden via the layers panel
+        are excluded. This matters for cam placement modes where binding
+        to a hidden polygon would silently hide the newly-placed marker
+        (the marker inherits the parent polygon's visibility state after
+        the next redraw), making the click feel like a no-op.
+        """
         if not self.apt_type_polygons:
             return None
+        _vis = self._make_vis_fn() if visible_only else None
         best_i, best_d = None, float("inf")
         for i, p in enumerate(self.apt_type_polygons):
+            if _vis is not None and not _vis("apt_type", i):
+                continue
             cx, cy = p.get("center_img", (0, 0))
             d = math.hypot(pos.x() - cx, pos.y() - cy)
             if d < best_d:
