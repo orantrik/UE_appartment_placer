@@ -195,16 +195,29 @@ def _fmt_origins(calibration: dict) -> str:
 
 
 def _extra_props_block(extra_mappings: list[tuple]) -> str:
+    """Emit the per-apartment extra-property assignment block.
+
+    M1a: previously used a bare `except Exception: pass`, so any failure
+    (wrong property type, BP renamed, etc.) was silently dropped and the
+    user would see "Spawned N actors" with zero indication that half their
+    extra props never made it onto the actors. We now log the exception
+    with the actor and property name so failures surface in the Output Log.
+
+    The emitted code lives inside `def _spawn_one_bp(apt):` in the BP
+    template, so it carries a 4-space indent (not 8 like the old inline
+    version).
+    """
     if not extra_mappings:
-        return "        # No extra properties configured.\n"
+        return "    # No extra properties configured.\n"
     lines = []
     for _, ue_var in extra_mappings:
         lines.append(textwrap.dedent(f"""\
         try:
             actor.set_editor_property({ue_var!r}, str(apt.get({ue_var!r}, "")))
-        except Exception:
-            pass"""))
-    return "\n".join("        " + ln for block in lines for ln in block.splitlines()) + "\n"
+        except Exception as _exprop_ex:
+            print(f"  WARN: could not set {ue_var!r} on apt "
+                  f"{{apt.get('apt_id', '?')}}: {{_exprop_ex}}")"""))
+    return "\n".join("    " + ln for block in lines for ln in block.splitlines()) + "\n"
 
 
 # Same palette as plan_canvas._COLORS — used as fallback when color_hex is absent
@@ -447,6 +460,93 @@ def _fmt_apt_type_info(
     return "\n".join(info_lines), obj_files, porch_cam_info
 
 
+# ── Shared runtime preamble ──────────────────────────────────────────────────
+# Injected into every generated script via {common_preamble}. Contains:
+#   • Play-in-Editor refusal guard (C2): spawning during PIE leaks actors
+#     into the throwaway PIE world and can corrupt ScopedEditorTransaction.
+#   • _spawn_actor() helper (H4): prefers the UE 5.1+ EditorActorSubsystem
+#     and falls back to EditorLevelLibrary.spawn_actor_from_class on older
+#     engines, avoiding the 5.6+ deprecation removal risk.
+#   • _z_for_floor(), _DIR_ABBREV, _dir_label: shared helpers hoisted from
+#     three duplicated copies (M5) so future tweaks stay in sync.
+# Assumes FLOOR_HEIGHT_CM and Z_BY_FLOOR_CM have already been declared in the
+# enclosing template above the injection point.
+_COMMON_PREAMBLE = '''\
+try:
+    if unreal.EditorLevelLibrary.editor_is_in_play_mode():
+        raise RuntimeError(
+            "Play-in-Editor is active. Stop PIE (Esc) before running this "
+            "script so actors spawn into the persistent level, not PIE's "
+            "throwaway world."
+        )
+except AttributeError:
+    pass  # pre-UE-5.0 builds without editor_is_in_play_mode
+
+def _spawn_actor(_cls, _loc, _rot):
+    """Spawn via EditorActorSubsystem on UE 5.1+, else EditorLevelLibrary.
+
+    Returns the spawned actor or None. Callers still need to None-check.
+    """
+    _sub = None
+    try:
+        _sub = unreal.get_editor_subsystem(unreal.EditorActorSubsystem)
+    except Exception:
+        _sub = None
+    if _sub is not None:
+        try:
+            return _sub.spawn_actor_from_class(_cls, _loc, _rot)
+        except Exception:
+            pass
+    return unreal.EditorLevelLibrary.spawn_actor_from_class(_cls, _loc, _rot)
+
+def _z_for_floor(f):
+    _fi = int(f)
+    if _fi in Z_BY_FLOOR_CM:
+        return Z_BY_FLOOR_CM[_fi]
+    return _fi * FLOOR_HEIGHT_CM
+
+_DIR_ABBREV = {
+    "\u05e6\u05e4\u05d5\u05df": "N", "\u05d3\u05e8\u05d5\u05dd": "S",
+    "\u05de\u05d6\u05e8\u05d7": "E", "\u05de\u05e2\u05e8\u05d1": "W",
+    "North": "N", "South": "S", "East": "E", "West": "W",
+}
+def _dir_label(s):
+    parts = []
+    for w in str(s).split():
+        w = w.lstrip("\u05d5")
+        if w in _DIR_ABBREV:
+            parts.append(_DIR_ABBREV[w])
+    return "".join(parts) or "?"
+'''
+
+
+# ── Volumes-only preamble: robust script-directory detection (C1) ───────────
+# `exec(open(p).read())` does NOT set __file__ in the exec'd namespace, so
+# the prior code that did `os.path.dirname(os.path.abspath(__file__))` could
+# crash before importing a single mesh. This preamble tries __file__ first,
+# falls back to a user-editable SCRIPT_DIR_OVERRIDE constant, and raises a
+# clear error (instead of an opaque NameError) if neither works.
+_VOLUMES_FS_PREAMBLE = '''\
+SCRIPT_DIR_OVERRIDE = ""  # paste the folder containing this .py + meshes/ if __file__ is unset
+
+try:
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    if SCRIPT_DIR_OVERRIDE and os.path.isdir(SCRIPT_DIR_OVERRIDE):
+        _script_dir = SCRIPT_DIR_OVERRIDE
+    else:
+        raise RuntimeError(
+            "__file__ is not defined in this Python context. To fix, either:\\n"
+            "  (a) Run via 'File > Execute Python Script' in the UE editor, or\\n"
+            "  (b) Use exec(open(p).read(), {\\"__file__\\": p}) instead of "
+            "exec(open(p).read()), or\\n"
+            "  (c) Paste this script's absolute folder into SCRIPT_DIR_OVERRIDE "
+            "at the top of this file."
+        )
+_asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
+'''
+
+
 # ── Shared: script header + OBJ import section ──────────────────────────────
 _VOLUMES_HEADER = '''\
 """
@@ -466,29 +566,15 @@ FLOOR_HEIGHT_CM = {floor_cm}
 # stacking. Generated from the user-configured floor-gap table; any floor
 # not listed here falls back to int(floor) * FLOOR_HEIGHT_CM.
 Z_BY_FLOOR_CM = {z_by_floor}
-def _z_for_floor(f):
-    _fi = int(f)
-    if _fi in Z_BY_FLOOR_CM:
-        return Z_BY_FLOOR_CM[_fi]
-    return _fi * FLOOR_HEIGHT_CM
 
+{common_preamble}
 MESH_ROOT = "{mesh_root}"
 
 APT_TYPE_MESH_INFO = {apt_type_mesh_info}
 
 APARTMENTS = {apartments}
 
-_DIR_ABBREV = {{
-    "צפון": "N", "דרום": "S", "מזרח": "E", "מערב": "W",
-    "North": "N", "South": "S", "East": "E", "West": "W",
-}}
-def _dir_label(s):
-    parts = [_DIR_ABBREV.get(w.lstrip("ו"), "") for w in str(s).split()]
-    return "".join(p for p in parts if p) or "?"
-
-_script_dir = os.path.dirname(os.path.abspath(__file__))
-_asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
-
+{fs_preamble}
 # ── Step 1: Import OBJ meshes + patch colours ─────────────────────────────
 print(f"  Mesh root folder: {{MESH_ROOT}}")
 for _key, (_ox, _oy, _ap, _col) in APT_TYPE_MESH_INFO.items():
@@ -561,29 +647,15 @@ FLOOR_HEIGHT_CM = {floor_cm}
 # stacking. Generated from the user-configured floor-gap table; any floor
 # not listed here falls back to int(floor) * FLOOR_HEIGHT_CM.
 Z_BY_FLOOR_CM = {z_by_floor}
-def _z_for_floor(f):
-    _fi = int(f)
-    if _fi in Z_BY_FLOOR_CM:
-        return Z_BY_FLOOR_CM[_fi]
-    return _fi * FLOOR_HEIGHT_CM
 
+{common_preamble}
 MESH_ROOT = "{mesh_root}"
 
 APT_TYPE_MESH_INFO = {apt_type_mesh_info}
 
 APARTMENTS = {apartments}
 
-_DIR_ABBREV = {{
-    "צפון": "N", "דרום": "S", "מזרח": "E", "מערב": "W",
-    "North": "N", "South": "S", "East": "E", "West": "W",
-}}
-def _dir_label(s):
-    parts = [_DIR_ABBREV.get(w.lstrip("ו"), "") for w in str(s).split()]
-    return "".join(p for p in parts if p) or "?"
-
-_script_dir = os.path.dirname(os.path.abspath(__file__))
-_asset_tools = unreal.AssetToolsHelpers.get_asset_tools()
-
+{fs_preamble}
 # ── Step 1: Import OBJ meshes (no colour patching in POI mode) ────────────
 print(f"  Mesh root folder: {{MESH_ROOT}}")
 for _key, (_ox, _oy, _ap, _col) in APT_TYPE_MESH_INFO.items():
@@ -663,7 +735,7 @@ def _spawn_one_static(apt):
         print(f"  WARNING: could not load asset {{_ap}}")
         _skipped_no_mesh.append(apt["apt_id"])
         return
-    _actor = unreal.EditorLevelLibrary.spawn_actor_from_class(
+    _actor = _spawn_actor(
         unreal.StaticMeshActor.static_class(),
         unreal.Vector(_ox, _oy, _z), unreal.Rotator(0, 0, 0))
     if _actor is None:
@@ -789,7 +861,7 @@ def _spawn_one_poi(apt):
         print(f"  WARNING: could not load asset {{_ap}}")
         _skipped_no_mesh.append(apt["apt_id"])
         return
-    _actor = unreal.EditorLevelLibrary.spawn_actor_from_class(
+    _actor = _spawn_actor(
         _poi_class, unreal.Vector(_ox, _oy, _z), unreal.Rotator(0, 0, 0))
     if _actor is None:
         print(f"  WARNING: spawn failed for apt {{apt['apt_id']}}")
@@ -884,8 +956,18 @@ def _spawn_one_poi(apt):
                     if _comp is not None:
                         print(f"  +{{_comp.get_name()}} "
                               f"class={{_comp.get_class().get_name()}}")
+                    else:
+                        # M4: previously swallowed silently. The Python wrapper
+                        # does not surface AddComponentByClass failures as
+                        # exceptions, so we detect the no-new-component case by
+                        # diffing ArrowComponent names and warn explicitly.
+                        print(f"  WARN: AddComponentByClass returned no new "
+                              f"component for apt {{apt['apt_id']}} cam "
+                              f"#{{_ci + 1}} — is {{POI_BLUEPRINT_PATH}} a "
+                              f"compatible BP with reflected AddComponentByClass?")
                 except Exception as _aex:
-                    print(f"  WARN: create component: {{_aex}}")
+                    print(f"  WARN: create component for apt "
+                          f"{{apt['apt_id']}} cam #{{_ci + 1}}: {{_aex}}")
                     _comp = None
             if _comp is None:
                 print(f"  WARN: no component for cam #{{_ci + 1}}")
@@ -941,8 +1023,18 @@ _POI_VOLUMES_TEMPLATE = _VOLUMES_HEADER_POI + _POI_SPAWN_LOOP         + _VOLUMES
 _SCRIPT_TEMPLATE = '''\
 """
 UE Apartment Placer — Auto-Generated Script
-Run in Unreal Engine: Window > Output Log > Python tab
-  exec(open(r"path/to/this_script.py").read())
+
+Run inside Unreal Engine (Window > Output Log > Python tab). Pick ONE:
+  • File > Execute Python Script (recommended — always sets __file__)
+  • exec(open(r"path/to/this_script.py").read(), {{"__file__": r"path/to/this_script.py"}})
+
+Plain `exec(open(p).read())` does NOT set __file__; this script is tolerant
+of that case (the preamble falls back gracefully), but the volume script is
+not, so prefer the patterns above.
+
+Note on undo (H1): spawns are committed in batches of _BATCH_SIZE (default
+100). One Ctrl+Z undoes one batch, not the whole run. If a batch errors out
+mid-way, earlier completed batches stay on disk.
 """
 import unreal
 
@@ -952,11 +1044,8 @@ FLOOR_HEIGHT_CM      = {floor_cm}
 # Per-floor Z offsets in cm. Any floor not listed falls back to
 # int(floor) * FLOOR_HEIGHT_CM. Built from the user's floor-gap overrides.
 Z_BY_FLOOR_CM        = {z_by_floor}
-def _z_for_floor(f):
-    _fi = int(f)
-    if _fi in Z_BY_FLOOR_CM:
-        return Z_BY_FLOOR_CM[_fi]
-    return _fi * FLOOR_HEIGHT_CM
+
+{common_preamble}
 BUILDING_SPACING_CM  = {building_cm}
 DIRECTION_SPACING_CM = {direction_cm}
 ENTRANCE_OFFSET_CM   = {entrance_cm}
@@ -965,7 +1054,7 @@ UNIT_STACK_OFFSET_CM = {stack_cm}
 # ── Apartment Data ────────────────────────────────────
 APARTMENTS = {apartments}
 
-# ── Direction Vectors ─────────────────────────────────
+# ── Direction Vectors (unique to the BP spawner) ──────
 DIRECTION_VECTORS = {{
     "צפון": (0.0,  1.0), "דרום": (0.0, -1.0),
     "מזרח": (1.0,  0.0), "מערב": (-1.0, 0.0),
@@ -981,18 +1070,6 @@ def _dir_vec(s):
         if w in DIRECTION_VECTORS:
             vx, vy = DIRECTION_VECTORS[w]; dx += vx; dy += vy; n += 1
     return (dx / n if n else 0, dy / n if n else 0)
-
-_DIR_ABBREV = {{
-    "צפון": "N", "דרום": "S", "מזרח": "E", "מערב": "W",
-    "North": "N", "South": "S", "East": "E", "West": "W",
-}}
-def _dir_label(s):
-    parts = []
-    for w in str(s).split():
-        w = w.lstrip("ו")
-        if w in _DIR_ABBREV:
-            parts.append(_DIR_ABBREV[w])
-    return "".join(parts) or "?"
 
 # ── Building & Entrance Order ─────────────────────────
 BUILDING_ORDER = {{}}
@@ -1066,22 +1143,38 @@ bp_class = unreal.load_class(None, BLUEPRINT_PATH)
 if bp_class is None:
     raise RuntimeError(f"Blueprint not found: {{BLUEPRINT_PATH}}")
 
+# H1: Batch the spawn loop the same way the volumes templates do. A single
+# giant ScopedEditorTransaction for hundreds of apartments (a) rolls back the
+# entire run on any one failure, (b) inflates the undo buffer in RAM, and (c)
+# keeps the Output Log silent until the whole loop finishes. Batching gives
+# progress visibility and partial-success resilience; the trade-off is that
+# one Ctrl+Z now undoes one batch, not the whole run.
+_BATCH_SIZE = 100
+
 spawned = 0
 skipped = []
 
-with unreal.ScopedEditorTransaction("Spawn Apartment Blueprints") as _trans:
-    for apt in APARTMENTS:
-        x, y, z = compute_location(apt)
-        actor = unreal.EditorLevelLibrary.spawn_actor_from_class(
-            bp_class, unreal.Vector(x, y, z), unreal.Rotator(0, 0, 0)
-        )
-        if actor is None:
-            skipped.append(apt["apt_id"]); continue
+def _spawn_one_bp(apt):
+    global spawned
+    x, y, z = compute_location(apt)
+    actor = _spawn_actor(
+        bp_class, unreal.Vector(x, y, z), unreal.Rotator(0, 0, 0))
+    if actor is None:
+        skipped.append(apt["apt_id"])
+        return
 {extra_props}
-        actor.set_actor_label(
-            f"Apt_{{apt['building']}}{{apt['entrance']}}_Fl{{int(apt['floor'])}}_E{{int(z // 100)}}m_{{_dir_label(apt['direction'])}}_ID{{apt['apt_id']}}"
-        )
-        spawned += 1
+    actor.set_actor_label(
+        f"Apt_{{apt['building']}}{{apt['entrance']}}_Fl{{int(apt['floor'])}}_E{{int(z // 100)}}m_{{_dir_label(apt['direction'])}}_ID{{apt['apt_id']}}"
+    )
+    spawned += 1
+
+for _bidx in range(0, len(APARTMENTS), _BATCH_SIZE):
+    _batch = APARTMENTS[_bidx:_bidx + _BATCH_SIZE]
+    _label = f"Spawn Apartment Blueprints [{{_bidx + 1}}-{{_bidx + len(_batch)}}]"
+    with unreal.ScopedEditorTransaction(_label) as _trans:
+        for apt in _batch:
+            _spawn_one_bp(apt)
+    print(f"  [batch {{_bidx // _BATCH_SIZE + 1}}: {{spawned}}/{{len(APARTMENTS)}} spawned]")
 
 print(f"\\n✓ Spawned {{spawned}} actors. Skipped: {{len(skipped)}}")
 '''
@@ -1105,6 +1198,7 @@ def generate(data: AppData) -> str:
         bp_path=data.blueprint_path,
         floor_cm=data.floor_height_cm,
         z_by_floor=_fmt_z_by_floor(z_by_floor),
+        common_preamble=_COMMON_PREAMBLE,
         building_cm=data.building_spacing_cm,
         direction_cm=data.direction_spacing_cm,
         entrance_cm=data.entrance_offset_cm,
@@ -1177,6 +1271,8 @@ def generate_volumes(
         script = _POI_VOLUMES_TEMPLATE.format(
             floor_cm=data.floor_height_cm,
             z_by_floor=z_by_floor_str,
+            common_preamble=_COMMON_PREAMBLE,
+            fs_preamble=_VOLUMES_FS_PREAMBLE,
             mesh_root=mesh_root,
             apt_type_mesh_info=apt_type_info_str,
             apartments=_fmt_apartments(apts),
@@ -1188,6 +1284,8 @@ def generate_volumes(
         script = _VOLUMES_TEMPLATE.format(
             floor_cm=data.floor_height_cm,
             z_by_floor=z_by_floor_str,
+            common_preamble=_COMMON_PREAMBLE,
+            fs_preamble=_VOLUMES_FS_PREAMBLE,
             mesh_root=mesh_root,
             apt_type_mesh_info=apt_type_info_str,
             apartments=_fmt_apartments(apts),
