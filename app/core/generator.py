@@ -901,8 +901,16 @@ def _apply_spring_arm(_actor, _target_len_cm, _pitch_ue, _yaw_ue):
             print(f"  WARN: SpringArm.TargetArmLength set failed: {{_ex}}")
             return False
     try:
+        # CRITICAL: unreal.Rotator positional args are ALPHABETICAL by
+        # field name: (pitch, roll, yaw) — NOT the C++ (pitch, yaw, roll)
+        # order. Using keyword args here so a future refactor doesn't
+        # accidentally stuff the yaw into the roll slot (which is what
+        # happened before and silently zeroed out the actual yaw).
         _sa_comp.set_relative_rotation(
-            unreal.Rotator(float(_pitch_ue), float(_yaw_ue), 0.0), False, False)
+            unreal.Rotator(pitch=float(_pitch_ue),
+                           yaw=float(_yaw_ue),
+                           roll=0.0),
+            False, False)
     except Exception as _ex:
         print(f"  WARN: SpringArm.set_relative_rotation failed: {{_ex}}")
         return False
@@ -1335,8 +1343,13 @@ def _apply_spring_arm(_actor, _len_cm, _pitch_ue, _yaw_ue):
         except Exception:
             return False
     try:
+        # unreal.Rotator positional order is ALPHABETICAL (pitch, roll, yaw);
+        # use keyword args to make intent explicit and survive refactors.
         _sa_comp.set_relative_rotation(
-            unreal.Rotator(float(_pitch_ue), float(_yaw_ue), 0.0), False, False)
+            unreal.Rotator(pitch=float(_pitch_ue),
+                           yaw=float(_yaw_ue),
+                           roll=0.0),
+            False, False)
     except Exception:
         return False
     return True
