@@ -94,6 +94,66 @@ def _fmt_apartments(apts: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _build_z_by_floor_cm(apts: list[dict], default_cm: int,
+                         overrides: dict) -> dict[int, int]:
+    """Compute a cumulative floor -> Z(cm) table.
+
+    Z(0) is always 0. For each floor n, Z(n+1) = Z(n) + gap(n), where gap(n)
+    comes from `overrides` (keyed by int(n)) if present, else `default_cm`.
+    Negative floors walk downward symmetrically: Z(n) = Z(n+1) - gap(n).
+
+    `overrides` keys may be str or int (JSON deserialisation sometimes
+    stringifies int keys); both are accepted.
+
+    The returned dict covers every integer floor between the min and max
+    floors appearing in `apts` (inclusive), plus 0 in case the data skips it.
+    """
+    def _gap(n: int) -> int:
+        if n in overrides:
+            return int(overrides[n])
+        s = str(n)
+        if s in overrides:
+            return int(overrides[s])
+        return int(default_cm)
+
+    floors = {0}
+    for a in apts:
+        try:
+            floors.add(int(float(a.get("floor", 0))))
+        except (TypeError, ValueError):
+            continue
+    for k in overrides.keys():
+        try:
+            ki = int(k)
+        except (TypeError, ValueError):
+            continue
+        floors.add(ki)
+        floors.add(ki + 1)
+
+    f_min = min(floors)
+    f_max = max(floors)
+
+    z_by_floor: dict[int, int] = {0: 0}
+    z = 0
+    for n in range(0, f_max):
+        z += _gap(n)
+        z_by_floor[n + 1] = z
+    z = 0
+    for n in range(0, f_min, -1):
+        z -= _gap(n - 1)
+        z_by_floor[n - 1] = z
+    return z_by_floor
+
+
+def _fmt_z_by_floor(z_by_floor: dict[int, int]) -> str:
+    """Format the Z-by-floor lookup as a deterministic dict literal."""
+    if not z_by_floor:
+        return "{}"
+    items = sorted(z_by_floor.items())
+    inside = ", ".join(f"{k}: {v}" for k, v in items)
+    return "{" + inside + "}"
+
+
 def _fmt_origins(calibration: dict) -> str:
     """Build the ENTRANCE_ORIGINS_CM dict literal from calibration data.
 
@@ -402,6 +462,16 @@ prefixed with the project name so re-imports never overwrite previous batches:
 import unreal, os
 
 FLOOR_HEIGHT_CM = {floor_cm}
+# Per-floor Z offsets in cm. Overrides the default floor*FLOOR_HEIGHT_CM
+# stacking. Generated from the user-configured floor-gap table; any floor
+# not listed here falls back to int(floor) * FLOOR_HEIGHT_CM.
+Z_BY_FLOOR_CM = {z_by_floor}
+def _z_for_floor(f):
+    _fi = int(f)
+    if _fi in Z_BY_FLOOR_CM:
+        return Z_BY_FLOOR_CM[_fi]
+    return _fi * FLOOR_HEIGHT_CM
+
 MESH_ROOT = "{mesh_root}"
 
 APT_TYPE_MESH_INFO = {apt_type_mesh_info}
@@ -487,6 +557,16 @@ prefixed with the project name so re-imports never overwrite previous batches:
 import unreal, os
 
 FLOOR_HEIGHT_CM = {floor_cm}
+# Per-floor Z offsets in cm. Overrides the default floor*FLOOR_HEIGHT_CM
+# stacking. Generated from the user-configured floor-gap table; any floor
+# not listed here falls back to int(floor) * FLOOR_HEIGHT_CM.
+Z_BY_FLOOR_CM = {z_by_floor}
+def _z_for_floor(f):
+    _fi = int(f)
+    if _fi in Z_BY_FLOOR_CM:
+        return Z_BY_FLOOR_CM[_fi]
+    return _fi * FLOOR_HEIGHT_CM
+
 MESH_ROOT = "{mesh_root}"
 
 APT_TYPE_MESH_INFO = {apt_type_mesh_info}
@@ -577,7 +657,7 @@ def _spawn_one_static(apt):
         _skipped_no_key.append((apt["apt_id"], _key))
         return
     _ox, _oy, _ap, _col = APT_TYPE_MESH_INFO[_key]
-    _z    = apt["floor"] * FLOOR_HEIGHT_CM
+    _z    = _z_for_floor(apt["floor"])
     _mesh = unreal.load_asset(_ap)
     if _mesh is None:
         print(f"  WARNING: could not load asset {{_ap}}")
@@ -703,7 +783,7 @@ def _spawn_one_poi(apt):
         _skipped_no_key.append((apt["apt_id"], _key))
         return
     _ox, _oy, _ap, _col = APT_TYPE_MESH_INFO[_key]
-    _z    = apt["floor"] * FLOOR_HEIGHT_CM
+    _z    = _z_for_floor(apt["floor"])
     _mesh = unreal.load_asset(_ap)
     if _mesh is None:
         print(f"  WARNING: could not load asset {{_ap}}")
@@ -869,6 +949,14 @@ import unreal
 # ── Config ────────────────────────────────────────────
 BLUEPRINT_PATH       = {bp_path!r}
 FLOOR_HEIGHT_CM      = {floor_cm}
+# Per-floor Z offsets in cm. Any floor not listed falls back to
+# int(floor) * FLOOR_HEIGHT_CM. Built from the user's floor-gap overrides.
+Z_BY_FLOOR_CM        = {z_by_floor}
+def _z_for_floor(f):
+    _fi = int(f)
+    if _fi in Z_BY_FLOOR_CM:
+        return Z_BY_FLOOR_CM[_fi]
+    return _fi * FLOOR_HEIGHT_CM
 BUILDING_SPACING_CM  = {building_cm}
 DIRECTION_SPACING_CM = {direction_cm}
 ENTRANCE_OFFSET_CM   = {entrance_cm}
@@ -970,7 +1058,7 @@ def compute_location(apt):
 
     X = ox + dir_x + stack_x
     Y = oy + dir_y + stack_y
-    Z = apt["floor"] * FLOOR_HEIGHT_CM
+    Z = _z_for_floor(apt["floor"])
     return X, Y, Z
 
 # ── Spawn ─────────────────────────────────────────────
@@ -1011,9 +1099,12 @@ def generate(data: AppData) -> str:
     if not apts:
         raise ValueError("No valid rows found after processing.")
 
+    z_by_floor = _build_z_by_floor_cm(
+        apts, data.floor_height_cm, data.floor_gaps_cm or {})
     return _SCRIPT_TEMPLATE.format(
         bp_path=data.blueprint_path,
         floor_cm=data.floor_height_cm,
+        z_by_floor=_fmt_z_by_floor(z_by_floor),
         building_cm=data.building_spacing_cm,
         direction_cm=data.direction_spacing_cm,
         entrance_cm=data.entrance_offset_cm,
@@ -1079,9 +1170,13 @@ def generate_volumes(
     porch_cam_info_str = repr(porch_cam_info)
     folder_code = _FOLDER_CODE if use_folders else _FOLDER_CODE_FLAT
 
+    z_by_floor = _build_z_by_floor_cm(
+        apts, data.floor_height_cm, data.floor_gaps_cm or {})
+    z_by_floor_str = _fmt_z_by_floor(z_by_floor)
     if use_poi:
         script = _POI_VOLUMES_TEMPLATE.format(
             floor_cm=data.floor_height_cm,
+            z_by_floor=z_by_floor_str,
             mesh_root=mesh_root,
             apt_type_mesh_info=apt_type_info_str,
             apartments=_fmt_apartments(apts),
@@ -1092,6 +1187,7 @@ def generate_volumes(
     else:
         script = _VOLUMES_TEMPLATE.format(
             floor_cm=data.floor_height_cm,
+            z_by_floor=z_by_floor_str,
             mesh_root=mesh_root,
             apt_type_mesh_info=apt_type_info_str,
             apartments=_fmt_apartments(apts),

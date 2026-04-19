@@ -5,6 +5,8 @@ from PyQt6.QtWidgets import (
 )
 from app.core.data_model import AppData
 from app.core import generator
+from app.widgets.ai_import_panel import AiImportPanel
+from app.widgets.floor_gaps_dialog import FloorGapsDialog
 from app.widgets.import_panel import ImportPanel
 from app.widgets.mapping_panel import MappingPanel
 from app.widgets.output_panel import OutputPanel
@@ -42,6 +44,10 @@ class MainWindow(QMainWindow):
         self._plan = PlanCanvas()
         tabs.addTab(self._plan, "🏢  Floor Plan")
 
+        # AI floor-plan import (fal.ai / Florence-2 region detection)
+        self._ai = AiImportPanel()
+        tabs.addTab(self._ai, "🤖  AI Import")
+
         # Script output
         self._output = OutputPanel()
         tabs.addTab(self._output, "📄  Script")
@@ -60,7 +66,9 @@ class MainWindow(QMainWindow):
         self._plan.calibration_changed.connect(self._on_calibration_changed)
         self._output.generate_requested.connect(self._on_generate)
         self._output.generate_volumes_requested.connect(self._on_generate_volumes)
+        self._output.floor_gaps_requested.connect(self._on_floor_gaps)
         self._plan.auto_place_requested.connect(self._on_auto_place)
+        self._ai.polygons_ready.connect(self._on_ai_polygons)
 
     # ── Slots ──────────────────────────────────────────────────────────
     def _on_file_loaded(self, df):
@@ -165,6 +173,57 @@ class MainWindow(QMainWindow):
             detail = traceback.format_exc()
             self._output.show_error(f"{e}\n\n{detail}")
             self._status.showMessage(f"Error: {e}")
+
+    def _on_floor_gaps(self):
+        """Open the Floor Gaps dialog, persist result on AppData."""
+        floors: list[int] = []
+        df = self._data.df
+        rm = self._data.required_mappings or {}
+        f_col = rm.get("floor", "")
+        if df is not None and f_col and f_col in df.columns:
+            seen: set[int] = set()
+            for v in df[f_col].dropna().tolist():
+                try:
+                    fi = int(float(v))
+                except (TypeError, ValueError):
+                    continue
+                if fi not in seen:
+                    seen.add(fi)
+                    floors.append(fi)
+            floors.sort()
+        if not floors:
+            floors = [0, 1, 2, 3, 4]
+
+        dlg = FloorGapsDialog(
+            self,
+            floors_present=floors,
+            default_cm=self._data.floor_height_cm,
+            overrides=self._data.floor_gaps_cm,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._data.floor_gaps_cm = dlg.result_overrides()
+        new_default = dlg.result_default_cm()
+        default_changed = new_default != self._data.floor_height_cm
+        self._data.floor_height_cm = new_default
+        n = len(self._data.floor_gaps_cm)
+        parts: list[str] = []
+        if default_changed:
+            parts.append(f"default floor height → {new_default / 100:g} m")
+        parts.append(
+            f"{n} override(s) active" if n
+            else "no overrides (default applied everywhere)")
+        self._status.showMessage("Floor gaps: " + "; ".join(parts) + ".")
+
+    def _on_ai_polygons(self, polygons: list):
+        if not polygons:
+            self._status.showMessage("AI Import: no polygons selected.")
+            return
+        added = self._plan.add_pending_polygons(polygons)
+        self._tabs.setCurrentWidget(self._plan)
+        self._status.showMessage(
+            f"Added {added} AI-detected polygon(s). "
+            "Use Move tool to drag into position.")
 
     def _on_auto_place(self):
         import pandas as _pd

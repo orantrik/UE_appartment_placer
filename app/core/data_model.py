@@ -21,6 +21,12 @@ class AppData:
     entrance_offset_cm: int = 500
     stack_offset_cm: int = 200
 
+    # Per-transition floor-gap overrides, keyed by the "from" floor index.
+    # e.g. {1: 900} means the gap from floor 1 to floor 2 is 900 cm instead
+    # of the global floor_height_cm. Every floor above the override shifts
+    # up by (override - floor_height_cm). Floors not listed use the default.
+    floor_gaps_cm: dict = field(default_factory=dict)
+
     blueprint_path: str = "/Game/BP_Apartment.BP_Apartment_C"
 
     # Free-text project name. Used as a prefix for the unique

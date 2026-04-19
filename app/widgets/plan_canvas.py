@@ -24,12 +24,13 @@ from PyQt6.QtGui import (
     QPainterPath, QFontMetrics,
 )
 from PyQt6.QtWidgets import (
+    QApplication,
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGraphicsEllipseItem, QGraphicsItem, QGraphicsScene, QGraphicsTextItem,
     QGraphicsView,
     QHBoxLayout, QInputDialog, QLabel,
-    QMainWindow, QMessageBox, QPushButton, QScrollArea, QSizePolicy,
-    QSplitter, QStatusBar, QToolBar, QVBoxLayout, QWidget,
+    QMainWindow, QMessageBox, QProgressDialog, QPushButton, QScrollArea,
+    QSizePolicy, QSplitter, QStatusBar, QToolBar, QVBoxLayout, QWidget,
 )
 from PyQt6.QtGui import QAction
 
@@ -243,7 +244,14 @@ class PlanCanvas(QWidget):
         # the most-recently-clicked polygon.
         self._multi_selection: list[tuple[str, int]] = []
         self._selection_items: list = []   # cyan dashed outlines per selected
+        # Background pixmap items.
+        # _bg_items holds one item per PDF page (or a single item for an
+        # image file). _bg_item aliases the first item and exists so that
+        # older code paths still work; _bg_size_px stores the total stacked
+        # (width, height) so AI-Import coord scaling stays correct.
         self._bg_item = None
+        self._bg_items: list = []
+        self._bg_size_px: tuple[int, int] = (0, 0)
 
         # ── Per-type color map (Feature 1) ─────────────────────────────────
         self._type_color_map: dict[str, int] = {}
@@ -334,7 +342,7 @@ class PlanCanvas(QWidget):
 
         self._mode_actions: dict[str, QAction] = {}
         for mode, icon, tip in [
-            ("select",       "↖  Select",      "Click a polygon to select it. Ctrl+Click to multi-select. Delete to remove."),
+            ("select",       "↖  Select",      "Click a polygon to select it. Ctrl+Click to multi-select. Ctrl+A selects every apt polygon. Delete to remove."),
             ("move",         "✥  Move",        "Click a polygon then drag it. Ctrl+Click adds polygons; drag any selected polygon to move the whole group."),
             ("transform",    "⟳  Transform",   "Click a polygon to show rotate/scale handles"),
             ("scale",        "📏  Scale",       "Drag to draw a reference line, then enter its real length"),
@@ -351,6 +359,10 @@ class PlanCanvas(QWidget):
         _act("↩  Undo",    self._undo_last, "Undo last polygon  (Ctrl+Z)")
         _act("🗑  Clear All", self._clear_all, "Remove all calibration data")
         tb.addSeparator()
+        _act("↕  Set Height", self._bulk_set_height,
+             "Bulk-set extrusion height for the selected apt-type polygons. "
+             "Optional: apply to every polygon of the same type. "
+             "Tip: Ctrl+A selects every apt polygon first.  (H)")
         _act("✓  Commit", self._commit_selected,
              "Recalculate camera parameters from polygon's current state  (Ctrl+S)")
         _act("✓✓  Commit All", self._commit_all,
@@ -396,6 +408,8 @@ class PlanCanvas(QWidget):
         self._view.sig_undo.connect(self._undo_last)
         self._view.sig_commit.connect(self._commit_selected)
         self._view.sig_escape.connect(self._on_escape)
+        self._view.sig_set_height.connect(self._bulk_set_height)
+        self._view.sig_select_all.connect(self._select_all_apt)
         splitter.addWidget(self._view)
 
         self._layers_panel = _LayersPanel()
@@ -469,7 +483,8 @@ class PlanCanvas(QWidget):
     def _load_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Load Floor Plan",
-            filter="Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff);;All (*)")
+            filter=("Floor plans (*.pdf *.png *.jpg *.jpeg *.bmp *.tif "
+                    "*.tiff);;All (*)"))
         if path:
             self.image_path = path
             self._render_image()
@@ -480,21 +495,120 @@ class PlanCanvas(QWidget):
             return
         self._scene.clear()
         self._bg_item = None
-        pix = QPixmap(self.image_path)
-        if pix.isNull():
+        self._bg_items = []
+        self._bg_size_px = (0, 0)
+
+        ext = os.path.splitext(self.image_path)[1].lower()
+        try:
+            if ext == ".pdf":
+                ok = self._render_pdf_pages(self.image_path)
+            else:
+                ok = self._render_single_image(self.image_path)
+        except Exception as exc:
             QMessageBox.warning(self, "Error",
-                                f"Cannot load image:\n{self.image_path}")
+                                f"Cannot load plan:\n{self.image_path}\n\n{exc}")
             return
-        self._bg_item = self._scene.addPixmap(pix)
-        self._bg_item.setZValue(-1)
-        w, h = pix.width(), pix.height()
-        # Pad by 3x image size on every side so zoom-in never traps the view.
+        if not ok:
+            return
+
+        w, h = self._bg_size_px
+        # Pad by 3x plan size on every side so zoom-in never traps the view.
         self._scene.setSceneRect(QRectF(-3 * w, -3 * h, 7 * w, 7 * h))
-        # Fit to the image bounds, not the full padded scene rect,
+        # Fit to the plan bounds, not the full padded scene rect,
         # so the user's initial view still frames the floor plan.
-        self._view.fitInView(QRectF(pix.rect()),
+        self._view.fitInView(QRectF(0, 0, w, h),
                              Qt.AspectRatioMode.KeepAspectRatio)
         self._redraw_overlay()
+
+    def _render_single_image(self, path: str) -> bool:
+        pix = QPixmap(path)
+        if pix.isNull():
+            QMessageBox.warning(self, "Error",
+                                f"Cannot load image:\n{path}")
+            return False
+        item = self._scene.addPixmap(pix)
+        item.setZValue(-1)
+        self._bg_item = item
+        self._bg_items = [item]
+        self._bg_size_px = (pix.width(), pix.height())
+        return True
+
+    def _render_pdf_pages(self, path: str, dpi: int = 150) -> bool:
+        """Render every page of a PDF and stack them vertically as separate
+        background pixmap items. Returns False if the user cancels or the
+        render fails.
+        """
+        from app.core import ai_analyzer
+
+        try:
+            import fitz  # PyMuPDF
+            doc = fitz.open(path)
+            n_pages = doc.page_count
+            doc.close()
+        except Exception as exc:
+            QMessageBox.warning(self, "PDF error",
+                                f"Cannot open PDF:\n{path}\n\n{exc}")
+            return False
+        if n_pages <= 0:
+            QMessageBox.warning(self, "PDF error", "PDF has no pages.")
+            return False
+
+        dlg = QProgressDialog(
+            f"Rendering {n_pages} page(s) at {dpi} DPI…",
+            "Cancel", 0, n_pages, self)
+        dlg.setWindowTitle("Loading PDF")
+        dlg.setMinimumDuration(0)
+        dlg.setValue(0)
+        QApplication.processEvents()
+
+        y_cursor = 0
+        max_w = 0
+        cancelled = False
+
+        def _on_page(i: int, total: int) -> None:
+            dlg.setValue(i)
+            dlg.setLabelText(f"Rendering page {i + 1} of {total}…")
+            QApplication.processEvents()
+
+        try:
+            pages = ai_analyzer.render_pdf_all_pages(
+                path, dpi=dpi, progress_cb=_on_page)
+        except Exception as exc:
+            dlg.close()
+            QMessageBox.warning(self, "PDF error",
+                                f"Failed rendering PDF:\n{path}\n\n{exc}")
+            return False
+
+        for i, (png, w, h) in enumerate(pages):
+            if dlg.wasCanceled():
+                cancelled = True
+                break
+            pm = QPixmap()
+            pm.loadFromData(png)
+            item = self._scene.addPixmap(pm)
+            item.setZValue(-1)
+            item.setOffset(0, y_cursor)
+            self._bg_items.append(item)
+            if self._bg_item is None:
+                self._bg_item = item
+            y_cursor += h
+            max_w = max(max_w, w)
+            dlg.setValue(i + 1)
+            QApplication.processEvents()
+
+        dlg.close()
+
+        if cancelled or not self._bg_items:
+            for item in self._bg_items:
+                self._scene.removeItem(item)
+            self._bg_items = []
+            self._bg_item = None
+            if cancelled:
+                self._set_status("PDF load cancelled.")
+            return False
+
+        self._bg_size_px = (max_w, y_cursor)
+        return True
 
     # ── Mouse events ───────────────────────────────────────────────────────
     def _axis_lock(self, pos: QPointF, anchor: QPointF) -> QPointF:
@@ -1771,8 +1885,10 @@ class PlanCanvas(QWidget):
         # tracking list so we don't keep stale references to removed items.
         self._selection_items = []
 
+        bg_set = set(self._bg_items) if self._bg_items else (
+            {self._bg_item} if self._bg_item is not None else set())
         for item in list(self._scene.items()):
-            if item is not self._bg_item:
+            if item not in bg_set:
                 self._scene.removeItem(item)
 
         # Reset item tracking lists
@@ -2425,12 +2541,163 @@ class PlanCanvas(QWidget):
             n += 1
         self._set_status(f"✓  Committed {n} polygon(s) — cameras synced")
 
+    # ── Select all apt polygons (Ctrl+A) ──────────────────────────────────
+    def _select_all_apt(self):
+        """Multi-select every apt_type polygon. Pair with H to bulk-set height.
+
+        Entrances and balcony cameras are intentionally not included — the
+        main Ctrl+A use case is bulk height, which only applies to apt
+        polygons. If the canvas is empty, status-bar the user instead of
+        silently doing nothing.
+        """
+        if not self.apt_type_polygons:
+            self._set_status("⚠  No apartment polygons to select.")
+            return
+        items = [("apt_type", i) for i in range(len(self.apt_type_polygons))]
+        self._set_multi_selection(items)
+        self._set_status(
+            f"↖  Selected all {len(items)} apt polygon(s). "
+            "Press H or click '↕ Set Height' to bulk-edit height.")
+
+    # ── Bulk set extrusion height ─────────────────────────────────────────
+    def _bulk_set_height(self):
+        """Open a dialog to set extrusion_m on every selected apt polygon.
+
+        Target set:
+          - base targets = all currently selected apt_type polygons
+          - if the user ticks "Apply to every polygon of this type", the
+            targets expand to every polygon matching type_name of the first
+            selected polygon (order preserved, no duplicates).
+
+        Polygons are marked uncommitted so the '*' badge reappears.
+        """
+        sel_idxs = [idx for (k, idx) in self._multi_selection if k == "apt_type"]
+        if (not sel_idxs and self._selected_type == "apt_type"
+                and self._selected_idx is not None):
+            sel_idxs = [self._selected_idx]
+        sel_idxs = [i for i in sel_idxs if 0 <= i < len(self.apt_type_polygons)]
+        sel_idxs = list(dict.fromkeys(sel_idxs))
+        if not sel_idxs:
+            self._set_status(
+                "⚠  Select at least one apartment polygon before bulk-setting height.")
+            return
+
+        sel_polys = [self.apt_type_polygons[i] for i in sel_idxs]
+        first_type = sel_polys[0].get("type_name", "")
+        n_of_type = sum(1 for p in self.apt_type_polygons
+                        if p.get("type_name", "") == first_type)
+        heights = {float(p.get("extrusion_m", 3.0)) for p in sel_polys}
+        prefill = heights.pop() if len(heights) == 1 else 3.0
+
+        dlg = _BulkHeightDialog(
+            self,
+            prefill=prefill,
+            n_selected=len(sel_idxs),
+            type_name=first_type,
+            n_of_type=n_of_type,
+        )
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_h, apply_to_type = dlg.result_values()
+
+        if apply_to_type and first_type:
+            target_idxs = [i for i, p in enumerate(self.apt_type_polygons)
+                           if p.get("type_name", "") == first_type]
+        else:
+            target_idxs = sel_idxs
+
+        n = 0
+        for i in target_idxs:
+            p = self.apt_type_polygons[i]
+            if float(p.get("extrusion_m", 3.0)) == new_h:
+                continue
+            p["extrusion_m"] = new_h
+            p["committed"] = False
+            n += 1
+        if n == 0:
+            self._set_status(
+                f"Height already {new_h:g} m on all targeted polygons — no change.")
+            return
+        self._redraw_overlay()
+        self._emit()
+        scope = (f"all {len(target_idxs)} '{first_type}' polygon(s)"
+                 if apply_to_type and first_type
+                 else f"{n} selected polygon(s)")
+        self._set_status(f"↕  Set height to {new_h:g} m on {scope}.")
+
     # ── Helpers ────────────────────────────────────────────────────────────
     def _set_status(self, msg: str):
         self._status_lbl.setText(msg)
 
     def _emit(self):
         self.calibration_changed.emit(self.get_calibration())
+
+    # ── External AI-import entry points ────────────────────────────────
+    @property
+    def canvas_image_size(self) -> tuple[int, int]:
+        """Width/height of the currently loaded floor-plan image in pixels.
+
+        Returns (0, 0) if no image has been loaded yet. Used by the AI Import
+        tab to scale proportional (0..1) coords to pixel-space polygon_img.
+        """
+        if self._bg_item is None:
+            return (0, 0)
+        # For multi-page PDFs, return the stacked (max_width, total_height).
+        # For single images, this equals the pixmap size.
+        if self._bg_size_px != (0, 0):
+            return self._bg_size_px
+        pix = self._bg_item.pixmap()
+        return (pix.width(), pix.height())
+
+    def add_pending_polygons(self, polygons: list[dict]) -> int:
+        """Append AI-detected (or otherwise externally-supplied) polygons to
+        the apt-type list.
+
+        Each dict must provide:
+          - building_id, entrance_id, type_name, polygon_img (list[(x,y)])
+        Optional: uid, extrusion_m, center_img, committed, source, ai_label.
+
+        World coords are back-filled automatically if a scale is set. Polygons
+        start uncommitted so the orange '*' badge appears until the user
+        positions them and clicks Commit.
+        """
+        import uuid as _uuid_mod
+        if not polygons:
+            return 0
+        added = 0
+        for p in polygons:
+            pts = p.get("polygon_img") or []
+            if len(pts) < 3:
+                continue
+            entry = dict(p)
+            entry.setdefault("uid", _uuid_mod.uuid4().hex[:10])
+            entry.setdefault("extrusion_m", 3.0)
+            entry.setdefault("building_id", "1")
+            entry.setdefault("entrance_id", "1")
+            entry.setdefault("type_name", "APT")
+            entry.setdefault("committed", False)
+            cx = sum(pt[0] for pt in pts) / len(pts)
+            cy = sum(pt[1] for pt in pts) / len(pts)
+            entry["center_img"] = (cx, cy)
+            entry.setdefault(
+                "color_hex", self._get_type_color(entry["type_name"]).name())
+            if self.scale_px_per_m:
+                s = self.scale_px_per_m
+                entry["world_x_m"] = round(cx / s, 3)
+                entry["world_y_m"] = round(cy / s, 3)
+                entry["polygon_world_m"] = [
+                    (round(px / s, 4), round(py / s, 4)) for px, py in pts
+                ]
+            self.apt_type_polygons.append(entry)
+            added += 1
+
+        if added:
+            self._redraw_overlay()
+            self._emit()
+            self._set_status(
+                f"Added {added} AI-detected polygon(s). "
+                "Use the Move tool to drag into position, then Commit All.")
+        return added
 
 
 # ── Custom Graphics View ────────────────────────────────────────────────────
@@ -2443,10 +2710,12 @@ class _PlanView(QGraphicsView):
     sig_move    = pyqtSignal(QPointF)
     sig_release = pyqtSignal(QPointF)
     sig_double  = pyqtSignal(QPointF)
-    sig_delete  = pyqtSignal()
-    sig_undo    = pyqtSignal()
-    sig_commit  = pyqtSignal()
-    sig_escape  = pyqtSignal()
+    sig_delete     = pyqtSignal()
+    sig_undo       = pyqtSignal()
+    sig_commit     = pyqtSignal()
+    sig_escape     = pyqtSignal()
+    sig_set_height = pyqtSignal()
+    sig_select_all = pyqtSignal()
 
     def __init__(self, scene, parent=None):
         super().__init__(scene, parent)
@@ -2472,6 +2741,13 @@ class _PlanView(QGraphicsView):
         elif (e.key() == Qt.Key.Key_S and
               e.modifiers() & Qt.KeyboardModifier.ControlModifier):
             self.sig_commit.emit()
+        elif (e.key() == Qt.Key.Key_A and
+              e.modifiers() & Qt.KeyboardModifier.ControlModifier):
+            self.sig_select_all.emit()
+        elif (e.key() == Qt.Key.Key_H and
+              not (e.modifiers() & (Qt.KeyboardModifier.ControlModifier |
+                                    Qt.KeyboardModifier.AltModifier))):
+            self.sig_set_height.emit()
         elif e.key() == Qt.Key.Key_Escape:
             self.sig_escape.emit()
         else:
@@ -2575,3 +2851,62 @@ class AptTypeDialog(QDialog):
             self._type.currentText().strip(),
             self._height.value(),
         )
+
+
+# ── Bulk Height Dialog ───────────────────────────────────────────────────────
+class _BulkHeightDialog(QDialog):
+    """Dialog for bulk-setting the extrusion height of multiple apt polygons.
+
+    Shows how many polygons are currently selected, offers a single height
+    spinner, and an optional "Apply to every polygon of type '<name>'"
+    checkbox that expands the target set to every polygon sharing the first
+    selected polygon's type_name. Useful for re-heighting all apartments of
+    a given type (e.g. every 'Type A' unit to 3.2 m) without Ctrl-clicking
+    each one.
+    """
+
+    def __init__(self, parent, prefill: float, n_selected: int,
+                 type_name: str, n_of_type: int):
+        super().__init__(parent)
+        self.setWindowTitle("Set Extrusion Height")
+        self.setModal(True)
+        self.setMinimumWidth(320)
+
+        layout = QFormLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        info = QLabel(f"Selected: {n_selected} apt polygon(s).")
+        info.setStyleSheet("color:#888;")
+        layout.addRow(info)
+
+        self._height = QDoubleSpinBox()
+        self._height.setRange(0.1, 99.0)
+        self._height.setValue(float(prefill))
+        self._height.setSuffix("  m")
+        self._height.setDecimals(2)
+        self._height.setSingleStep(0.1)
+        layout.addRow("New height:", self._height)
+
+        self._apply_to_type = QCheckBox(
+            f"Apply to every polygon of type '{type_name}' ({n_of_type} total)"
+            if type_name else "Apply to every polygon of the same type"
+        )
+        self._apply_to_type.setChecked(False)
+        if not type_name or n_of_type <= n_selected:
+            self._apply_to_type.setEnabled(False)
+        layout.addRow(self._apply_to_type)
+
+        btns = QHBoxLayout()
+        ok = QPushButton("Apply  ↵")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btns.addStretch(1)
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+        layout.addRow(btns)
+
+    def result_values(self) -> tuple[float, bool]:
+        return self._height.value(), self._apply_to_type.isChecked()

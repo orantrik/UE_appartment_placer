@@ -9,6 +9,7 @@ from PyQt6.QtGui import QFont
 class OutputPanel(QWidget):
     generate_requested = pyqtSignal()
     generate_volumes_requested = pyqtSignal()
+    floor_gaps_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -61,6 +62,16 @@ class OutputPanel(QWidget):
         )
         gen_vol_btn.clicked.connect(self.generate_volumes_requested)
         layout.addWidget(gen_vol_btn)
+
+        # Floor gaps configurator — only affects Z per floor, no mesh changes.
+        gaps_btn = QPushButton("↕  Floor Gaps…")
+        gaps_btn.setToolTip(
+            "Configure custom Z gaps between specific consecutive floors.\n"
+            "Default stacking is floor × 3 m. Override, for example, the "
+            "floor 1 → 2 gap to 9 m and every floor above shifts up by 6 m."
+        )
+        gaps_btn.clicked.connect(self.floor_gaps_requested)
+        layout.addWidget(gaps_btn)
 
         # Folder hierarchy option
         self._folders_cb = QCheckBox("🗂  World Outliner folder hierarchy  (Apartments / Building / Entrance / Type)")
