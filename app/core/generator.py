@@ -387,7 +387,15 @@ def _polygon_to_obj(key: tuple, polygon_world_m: list, center_world_m: tuple,
 def _fmt_apt_type_info(
     calibration: dict,
     mesh_root: str = "/Game/ApartmentMeshes",
-) -> tuple[str, dict[str, str], dict]:
+) -> tuple[str, dict[str, str], dict, dict]:
+    """Return (apt_type_info_src, obj_files, porch_cam_info, spring_arm_info).
+
+    ``spring_arm_info`` maps (building, entrance, type) →
+    ``(sx_cm, sy_cm, pitch_deg_or_none)`` where pitch_deg_or_none is the
+    user's intuitive (+ = camera UP) per-polygon override, or ``None`` when
+    the polygon falls back to the global default baked separately into
+    the script as DEFAULT_SA_PITCH_DEG.
+    """
     polys = calibration.get("apt_type_polygons", [])
     valid = [p for p in polys
              if "world_x_m" in p
@@ -397,7 +405,7 @@ def _fmt_apt_type_info(
              and "entrance_id" in p
              and "type_name" in p]
     if not valid:
-        return "{}", {}, {}
+        return "{}", {}, {}, {}
 
     min_x = min(p["world_x_m"] for p in valid)
     min_y = min(p["world_y_m"] for p in valid)
@@ -412,6 +420,7 @@ def _fmt_apt_type_info(
     info_lines = ["{"]
     obj_files: dict[str, str] = {}
     porch_cam_info: dict = {}
+    spring_arm_info: dict = {}
 
     for p in valid:
         b = str(p["building_id"])
@@ -456,8 +465,26 @@ def _fmt_apt_type_info(
         if _cam_tuples:
             porch_cam_info[key] = _cam_tuples
 
+        # Spring-arm cam: one per polygon, optional. Always looks at
+        # centroid in the generated script, so we bake only the cam's
+        # XY in the same normalized cm frame as the actor origin plus
+        # the per-polygon pitch override (or None → use default).
+        _sa = p.get("spring_arm")
+        if (isinstance(_sa, dict)
+                and "world_x_m" in _sa
+                and "world_y_m" in _sa):
+            _sx_cm = round((_sa["world_x_m"] - min_x) * 100, 1)
+            _sy_cm = round((_sa["world_y_m"] - min_y) * 100, 1)
+            _pitch = _sa.get("pitch_deg")
+            if _pitch is not None:
+                try:
+                    _pitch = float(_pitch)
+                except (TypeError, ValueError):
+                    _pitch = None
+            spring_arm_info[key] = (_sx_cm, _sy_cm, _pitch)
+
     info_lines.append("}")
-    return "\n".join(info_lines), obj_files, porch_cam_info
+    return "\n".join(info_lines), obj_files, porch_cam_info, spring_arm_info
 
 
 # ── Shared runtime preamble ──────────────────────────────────────────────────
@@ -768,6 +795,16 @@ if not POI_BLUEPRINT_PATH.endswith("_C"):
 
 PORCH_CAM_INFO = {porch_cam_info}
 
+# Spring-arm targets: (cam_x_cm, cam_y_cm, pitch_deg_or_None) per apt key.
+# Pitch is in the user's intuitive convention (+ = camera UP). The
+# spawner INVERTS it before feeding UE's SpringArm, which uses the
+# opposite sign (+ SA pitch rotates the arm up, dropping the camera).
+# When pitch is None for a given key the global DEFAULT_SA_PITCH_DEG is
+# applied instead — same intuitive sign, same inversion at the setter.
+SPRING_ARM_INFO = {spring_arm_info}
+
+DEFAULT_SA_PITCH_DEG = {default_sa_pitch_deg}
+
 # Spawn in batches so the UE editor's MassLODSubsystem does not exceed its
 # fixed-size ClientIndex pool (assertion in MassLODSubsystem.cpp) as many
 # BalconyViewArrowComponent viewers register simultaneously. 100 is safe
@@ -806,6 +843,70 @@ DESTROY_PORCH_CAMS_POST_SPAWN = False
 _poi_class = unreal.load_class(None, POI_BLUEPRINT_PATH)
 if _poi_class is None:
     raise RuntimeError(f"POI Blueprint not found: {{POI_BLUEPRINT_PATH}}")
+
+# ── SpringArm math helper ─────────────────────────────────────────────────
+# Computes (target_arm_length_cm, sa_pitch_ue, sa_yaw_ue) from the apt
+# origin + cam target + intuitive pitch. Pitch INVERSION happens here,
+# once — callers pass the user-facing value and receive UE-ready numbers.
+# Geometry (UE frame, +X forward, +Y right, +Z up, Rotator=(Pitch,Yaw,Roll)):
+#   Camera sits at SpringArm origin - L * Forward, where
+#     Forward = (cos(Y)cos(P), sin(Y)cos(P), sin(P))
+#   We only constrain the XY placement (dx, dy); Z of cam comes from pitch.
+#   L_xy = hypot(dx, dy); SpringArm yaw Y satisfies
+#     (dx, dy) = -L_xy * (cos(Y), sin(Y))  -> Y = atan2(-dy, -dx)
+#   Intuitive pitch P_u (+ = camera UP) maps to UE SpringArm pitch = -P_u.
+import math as _math_sa
+def _sa_compute(_ox, _oy, _sx, _sy, _pitch_user):
+    _dx = _sx - _ox
+    _dy = _sy - _oy
+    _L = _math_sa.hypot(_dx, _dy)
+    _yaw = _math_sa.degrees(_math_sa.atan2(-_dy, -_dx))
+    _pitch_ue = -float(_pitch_user)
+    return _L, _pitch_ue, _yaw
+
+def _apply_spring_arm(_actor, _target_len_cm, _pitch_ue, _yaw_ue):
+    """Locate the SpringArm component on ``_actor`` and stamp its
+    TargetArmLength + rotation. Silent no-op if the BP has no SpringArm
+    (keeps the generator compatible with non-SpringArm POI Blueprints).
+    Returns True on apply, False otherwise.
+    """
+    _sa_cls = getattr(unreal, 'SpringArmComponent', None)
+    _sa_comp = None
+    if _sa_cls is not None:
+        try:
+            for _c in _actor.get_components_by_class(_sa_cls):
+                _sa_comp = _c
+                break
+        except Exception:
+            _sa_comp = None
+    if _sa_comp is None:
+        # Fallback: search by component name. Matches the name used by
+        # BP__Persistant_POI ("SpringArm") but also any BP that happens
+        # to name a SceneComponent "SpringArm".
+        try:
+            for _c in _actor.get_components_by_class(unreal.SceneComponent):
+                if _c.get_name() == "SpringArm":
+                    _sa_comp = _c
+                    break
+        except Exception:
+            pass
+    if _sa_comp is None:
+        return False
+    try:
+        _sa_comp.set_editor_property("target_arm_length", float(_target_len_cm))
+    except Exception:
+        try:
+            _sa_comp.set_editor_property("TargetArmLength", float(_target_len_cm))
+        except Exception as _ex:
+            print(f"  WARN: SpringArm.TargetArmLength set failed: {{_ex}}")
+            return False
+    try:
+        _sa_comp.set_relative_rotation(
+            unreal.Rotator(float(_pitch_ue), float(_yaw_ue), 0.0), False, False)
+    except Exception as _ex:
+        print(f"  WARN: SpringArm.set_relative_rotation failed: {{_ex}}")
+        return False
+    return True
 
 def _tame_viewer(_c):
     """Minimise an arrow/viewer component's Mass-LOD footprint.
@@ -1065,6 +1166,28 @@ def _spawn_one_poi(apt):
             print(f"  Cam #{{_ci + 1}} "
                   f"rel({{_rel_loc.x:.1f}}, {{_rel_loc.y:.1f}}, "
                   f"{{_rel_loc.z:.1f}}) yaw={{_pyaw}} [attached:relative]")
+
+    # ── Position the SpringArm (BP-provided, SCS-persistent) ─────────────
+    # The SpringArm already exists on the BP; we only stamp its
+    # TargetArmLength + rotation. When this apt has no user-placed SA
+    # cam, we leave the BP defaults alone rather than forcing zero.
+    _sa_info = SPRING_ARM_INFO.get(_key)
+    if _sa_info is not None:
+        _sx_cm, _sy_cm, _sa_pitch_override = _sa_info
+        _sa_pitch_user = (DEFAULT_SA_PITCH_DEG
+                          if _sa_pitch_override is None
+                          else float(_sa_pitch_override))
+        _sa_len, _sa_pitch_ue, _sa_yaw_ue = _sa_compute(
+            _ox, _oy, _sx_cm, _sy_cm, _sa_pitch_user)
+        _ok = _apply_spring_arm(_actor, _sa_len, _sa_pitch_ue, _sa_yaw_ue)
+        if _ok:
+            print(f"  SpringArm len={{_sa_len:.1f}}cm "
+                  f"yaw={{_sa_yaw_ue:.1f}} "
+                  f"pitch_ue={{_sa_pitch_ue:+.1f}} "
+                  f"(user={{_sa_pitch_user:+.1f}})")
+        else:
+            print(f"  NOTE: SpringArm not found on {{apt['apt_id']}} "
+                  f"({{POI_BLUEPRINT_PATH}}) — skipping SA positioning")
 {folder_code}    _spawned += 1
 
 for _bidx in range(0, len(APARTMENTS), _BATCH_SIZE):
@@ -1122,9 +1245,13 @@ _REFRESH_CAMS_TEMPLATE = '''\
 """refresh_balcony_cams.py — UE editor utility
 
 Run this in Unreal Engine AFTER you've moved/fine-tuned BP_POI actors in
-the editor and some balcony cameras (#2+) have disappeared. Cam #1
-(the Blueprint's SCS PorchPawnArrow) is SCS-persistent and never lost,
-so this script never recreates it.
+the editor and some balcony cameras (#2+) have disappeared, OR the
+SpringArm has drifted from the configured length/rotation.
+
+Cam #1 (the Blueprint's SCS PorchPawnArrow) is SCS-persistent and never
+lost. The SpringArm is also SCS-persistent, but editor moves that
+re-run the Construction Script can reset its TargetArmLength and
+Rotation back to BP defaults — this script restores them.
 
 Usage:
   1. Drop this file next to spawn_volumes.py (same folder).
@@ -1134,18 +1261,22 @@ Usage:
 What it does:
   • Scans the current level for BP_POI actors.
   • Identifies each actor by its label (format '<apt_id>_<floor>').
-  • Looks up the baked PORCH_CAM_INFO for that apartment type.
+  • Looks up the baked PORCH_CAM_INFO and SPRING_ARM_INFO for that key.
   • If the actor is missing one or more of cam #2..N, wipes any partial
     survivors and recreates the full cam #2..N set with the same robust
     manual_attachment + register + attach_to_component pipeline the
     main spawn script uses, so future editor moves won't wipe them.
+  • Re-applies SpringArm TargetArmLength + rotation on every processed
+    actor, so tilted/elongated cams stay that way after editor moves.
   • Batched (100 actors per ScopedEditorTransaction) to avoid Mass-LOD
     ClientIndex overflow.
 
-Idempotent: actors with the correct cam count are skipped.
+Idempotent: cam #2..N recreation is skipped when counts already match;
+SpringArm is always re-stamped (the setters are cheap and overwriting
+with identical values is a no-op from the editor's perspective).
 """
 
-import os, unreal
+import math, os, unreal
 
 FLOOR_HEIGHT_CM = {floor_cm}
 Z_BY_FLOOR_CM = {z_by_floor}
@@ -1161,6 +1292,54 @@ APT_TYPE_MESH_INFO = {apt_type_mesh_info}
 APARTMENTS = {apartments}
 
 PORCH_CAM_INFO = {porch_cam_info}
+
+SPRING_ARM_INFO = {spring_arm_info}
+
+DEFAULT_SA_PITCH_DEG = {default_sa_pitch_deg}
+
+
+def _sa_compute(_ox, _oy, _sx, _sy, _pitch_user):
+    """See main spawn script. Returns UE-ready (len, pitch, yaw)."""
+    _dx = _sx - _ox
+    _dy = _sy - _oy
+    _L = math.hypot(_dx, _dy)
+    _yaw = math.degrees(math.atan2(-_dy, -_dx))
+    return _L, -float(_pitch_user), _yaw
+
+
+def _apply_spring_arm(_actor, _len_cm, _pitch_ue, _yaw_ue):
+    _sa_cls = getattr(unreal, 'SpringArmComponent', None)
+    _sa_comp = None
+    if _sa_cls is not None:
+        try:
+            for _c in _actor.get_components_by_class(_sa_cls):
+                _sa_comp = _c
+                break
+        except Exception:
+            pass
+    if _sa_comp is None:
+        try:
+            for _c in _actor.get_components_by_class(unreal.SceneComponent):
+                if _c.get_name() == "SpringArm":
+                    _sa_comp = _c
+                    break
+        except Exception:
+            pass
+    if _sa_comp is None:
+        return False
+    try:
+        _sa_comp.set_editor_property("target_arm_length", float(_len_cm))
+    except Exception:
+        try:
+            _sa_comp.set_editor_property("TargetArmLength", float(_len_cm))
+        except Exception:
+            return False
+    try:
+        _sa_comp.set_relative_rotation(
+            unreal.Rotator(float(_pitch_ue), float(_yaw_ue), 0.0), False, False)
+    except Exception:
+        return False
+    return True
 
 # (apt_id str, floor int) → (building, entrance, type)
 _APT_LOOKUP = {{
@@ -1215,6 +1394,8 @@ _restored = 0
 _already_ok = 0
 _unknown_label = 0
 _no_extras_configured = 0
+_sa_applied = 0
+_sa_skipped = 0
 
 def _parse_label(_label):
     """'<apt_id>_<floor>' -> (apt_id_str, floor_int) or None."""
@@ -1229,7 +1410,7 @@ def _parse_label(_label):
 
 def _process_actor(_actor):
     global _processed, _restored, _already_ok, _unknown_label
-    global _no_extras_configured
+    global _no_extras_configured, _sa_applied, _sa_skipped
     try:
         _label = _actor.get_actor_label()
     except Exception:
@@ -1244,6 +1425,26 @@ def _process_actor(_actor):
     if _key is None:
         _unknown_label += 1
         return
+
+    # SpringArm is refreshed on every processed actor (it's SCS-persistent
+    # but Construction Script reruns can reset its properties). We do this
+    # BEFORE the cam-extras early-out so SA gets refreshed even on actors
+    # that have no configured balcony cams beyond cam #1.
+    _sa_info = SPRING_ARM_INFO.get(_key)
+    if _sa_info is not None:
+        _mesh_info_sa = APT_TYPE_MESH_INFO.get(_key)
+        if _mesh_info_sa is not None:
+            _ox_sa, _oy_sa, _ap_sa, _col_sa = _mesh_info_sa
+            _sx_cm, _sy_cm, _sa_pitch_override = _sa_info
+            _sa_pitch_user = (DEFAULT_SA_PITCH_DEG
+                              if _sa_pitch_override is None
+                              else float(_sa_pitch_override))
+            _L, _p_ue, _y_ue = _sa_compute(
+                _ox_sa, _oy_sa, _sx_cm, _sy_cm, _sa_pitch_user)
+            if _apply_spring_arm(_actor, _L, _p_ue, _y_ue):
+                _sa_applied += 1
+            else:
+                _sa_skipped += 1
 
     _pcam_raw = PORCH_CAM_INFO.get(_key)
     if not _pcam_raw:
@@ -1371,7 +1572,9 @@ print(
     f"Restored={{_restored}} "
     f"AlreadyOK={{_already_ok}} "
     f"NoExtrasConfigured={{_no_extras_configured}} "
-    f"UnknownLabel={{_unknown_label}}")
+    f"UnknownLabel={{_unknown_label}} "
+    f"SpringArmApplied={{_sa_applied}} "
+    f"SpringArmSkipped={{_sa_skipped}}")
 '''
 
 
@@ -1614,9 +1817,16 @@ def generate_volumes(
 
     mesh_root = _make_mesh_root(project_name or data.project_name)
 
-    apt_type_info_str, obj_files, porch_cam_info = _fmt_apt_type_info(
-        data.calibration, mesh_root=mesh_root)
-    porch_cam_info_str = repr(porch_cam_info)
+    apt_type_info_str, obj_files, porch_cam_info, spring_arm_info = (
+        _fmt_apt_type_info(data.calibration, mesh_root=mesh_root))
+    porch_cam_info_str   = repr(porch_cam_info)
+    spring_arm_info_str  = repr(spring_arm_info)
+    # AppData is authoritative for the default SA pitch, but the loaded
+    # calibration dict keeps a mirror; prefer AppData so in-app tweaks
+    # that haven't been saved still bake correctly.
+    _default_sa_pitch = float(
+        getattr(data, "default_spring_arm_pitch_deg", 0.0) or 0.0)
+    default_sa_pitch_str = repr(_default_sa_pitch)
     folder_code = _FOLDER_CODE if use_folders else _FOLDER_CODE_FLAT
 
     z_by_floor = _build_z_by_floor_cm(
@@ -1634,6 +1844,8 @@ def generate_volumes(
             folder_code=folder_code,
             poi_bp_path=poi_bp_path,
             porch_cam_info=porch_cam_info_str,
+            spring_arm_info=spring_arm_info_str,
+            default_sa_pitch_deg=default_sa_pitch_str,
         )
         # Ship the refresh utility alongside spawn_volumes.py so the user
         # can restore cam #2+ if a BP_POI move in the editor ever wipes
@@ -1646,6 +1858,8 @@ def generate_volumes(
             apartments=_fmt_apartments(apts),
             poi_bp_path=poi_bp_path,
             porch_cam_info=porch_cam_info_str,
+            spring_arm_info=spring_arm_info_str,
+            default_sa_pitch_deg=default_sa_pitch_str,
         )
     else:
         script = _VOLUMES_TEMPLATE.format(

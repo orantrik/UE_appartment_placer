@@ -62,6 +62,50 @@ def _migrate_balcony_cams(p: dict) -> list[dict]:
     return []
 
 
+# ── Spring-arm cam helpers ────────────────────────────────────────────────
+# One SpringArm target per apt-type polygon. The cam is always "looking at"
+# the polygon's centroid — the placement only picks its XY projection (the
+# arm's resting state) and pitch. Yaw is derived (arm points from the cam
+# back to the centroid) and TargetArmLength comes from the 2D distance.
+#
+# UI pitch convention: "intuitive" — positive slider value means camera
+# tilts UP. Internally inverted before feeding UE's SpringArm (see
+# generator.py), because UE's SpringArm pitch rotates the arm not the cam:
+# + UE-pitch swings the arm up, which drops the camera downward.
+_SA_CAM_COLOR = "#00d4ff"        # distinct from balcony-cam red (#ff6b6b)
+_SA_CAM_FILL  = QColor(0, 212, 255, 80)
+_SA_HIT_RADIUS_PX = 12.0         # cam marker click tolerance
+_SA_PITCH_MIN = -60.0
+_SA_PITCH_MAX =  60.0
+
+
+def _spring_arm(p: dict) -> dict | None:
+    """Return p['spring_arm'] dict if valid (has img_x/img_y), else None."""
+    sa = p.get("spring_arm")
+    if isinstance(sa, dict) and "img_x" in sa and "img_y" in sa:
+        return sa
+    return None
+
+
+def _effective_sa_pitch(p: dict, default_pitch: float) -> float:
+    """Return the pitch to display / bake for this polygon.
+
+    Per-polygon ``spring_arm['pitch_deg']`` wins if present; otherwise the
+    global default. Always returned in the user's intuitive convention
+    (positive = camera UP).
+    """
+    sa = _spring_arm(p)
+    if sa is None:
+        return float(default_pitch)
+    v = sa.get("pitch_deg")
+    if v is None:
+        return float(default_pitch)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float(default_pitch)
+
+
 class _OutlinedTextItem(QGraphicsTextItem):
     """QGraphicsTextItem that renders white text with a black outline stroke."""
 
@@ -215,6 +259,10 @@ class PlanCanvas(QWidget):
 
     calibration_changed  = pyqtSignal(dict)
     auto_place_requested = pyqtSignal()
+    # Fires whenever the user nudges the global default spring-arm pitch
+    # (toolbar spinbox). window.py mirrors this onto AppData so the
+    # generator bakes it into DEFAULT_SA_PITCH_DEG.
+    default_sa_pitch_changed = pyqtSignal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -275,11 +323,24 @@ class PlanCanvas(QWidget):
         self._move_orig_pts_list: list[list] = []   # original polygon_img per target
         self._move_orig_centers: list[tuple] = []   # original center_img per target
         self._move_orig_cams_list: list[list] = []  # [[(img_x,img_y), ...], ...]
+        # Per-target original spring-arm pos (or None if unplaced) so we
+        # can translate/scale/rotate it together with polygon + balcony
+        # cams. Length mirrors _move_orig_pts_list.
+        self._move_orig_sa_list: list[tuple | None] = []
 
         # ── Balcony cam two-click state ─────────────────────────────────────
         self._cam_pending_idx: int | None = None      # apt_type idx awaiting yaw click
         self._cam_pending_pos: QPointF | None = None  # position of first click (scene coords)
         self._cam_yaw_preview = None                  # live arrow preview item
+
+        # ── Spring-arm cam state ────────────────────────────────────────────
+        # Global default pitch (intuitive: + = camera UP). Per-polygon pitch
+        # stored on each p["spring_arm"]["pitch_deg"]; falls back here when
+        # absent. Synced to AppData via default_sa_pitch_changed.
+        self._default_sa_pitch_deg: float = 0.0
+        # Toolbar widget reference so we can programmatically seed / refresh
+        # the value without firing the changed signal back.
+        self._sa_default_spin: QDoubleSpinBox | None = None
 
         # ── Transform mode state ────────────────────────────────────────────
         self._xform_target: tuple | None = None
@@ -289,6 +350,9 @@ class PlanCanvas(QWidget):
         self._xform_orig_pts: list | None = None
         self._xform_orig_center: tuple | None = None
         self._xform_bbox: tuple | None = None    # (minx, miny, maxx, maxy)
+        # Saved (img_x, img_y) of the polygon's spring-arm cam at
+        # transform-drag start so rotate/scale can re-project it.
+        self._xform_orig_sa: tuple | None = None
 
         # ── Alignment guide lines ───────────────────────────────────────────
         self._align_guides: list = []
@@ -349,12 +413,34 @@ class PlanCanvas(QWidget):
             ("apt_type",     "🏠  Apt Type",    "Click vertices around one apartment's footprint. Close near first vertex or double-click."),
             ("vertex_edit",  "✏  Edit Verts",  "Click polygon → drag yellow handles  |  Ctrl+Click edge → add vertex  |  Alt+Click vertex → delete"),
             ("balcony_cam",  "📷  Balcony Cam", "Two-click: position then aim. Click on existing cam to remove. Multiple cams per polygon supported."),
+            ("spring_arm",   "🎥  Spring Arm",  "Click inside a polygon to place its spring-arm camera. Arm always aims at the polygon centre; length = distance; pitch per-polygon (double-click the cam to edit) or via the default slider."),
         ]:
             a = _act(icon, lambda _, m=mode: self._set_mode(m),
                      tip, checkable=True)
             self._mode_actions[mode] = a
 
         self._mode_actions["select"].setChecked(True)
+        tb.addSeparator()
+
+        # ── Default spring-arm pitch (intuitive: + = camera UP) ─────────────
+        tb.addWidget(QLabel("  Default SA pitch"))
+        self._sa_default_spin = QDoubleSpinBox()
+        self._sa_default_spin.setRange(_SA_PITCH_MIN, _SA_PITCH_MAX)
+        self._sa_default_spin.setSingleStep(1.0)
+        self._sa_default_spin.setDecimals(1)
+        self._sa_default_spin.setSuffix("°")
+        self._sa_default_spin.setValue(self._default_sa_pitch_deg)
+        self._sa_default_spin.setToolTip(
+            "Default SpringArm pitch applied to every polygon whose "
+            "per-polygon pitch is unset. Positive = camera tilts UP. "
+            "Use 'Apply to all' to overwrite per-polygon overrides.")
+        self._sa_default_spin.setFixedWidth(72)
+        self._sa_default_spin.valueChanged.connect(self._on_default_sa_pitch_changed)
+        tb.addWidget(self._sa_default_spin)
+        _act("📌  Apply SA Default",
+             self._apply_default_sa_pitch_to_all,
+             "Stamp the default pitch onto every placed spring-arm cam. "
+             "Prompts before overwriting per-polygon pitch overrides.")
         tb.addSeparator()
         _act("↩  Undo",    self._undo_last, "Undo last polygon  (Ctrl+Z)")
         _act("🗑  Clear All", self._clear_all, "Remove all calibration data")
@@ -436,9 +522,14 @@ class PlanCanvas(QWidget):
             self._move_orig_pts_list = []
             self._move_orig_centers = []
             self._move_orig_cams_list = []
+            self._move_orig_sa_list = []
         # Leaving balcony_cam: cancel pending two-click placement
         if self._mode == "balcony_cam" and mode != "balcony_cam":
             self._cancel_cam_pending()
+        # Leaving spring_arm mode has no transient state to clean up — all
+        # state lives on the polygon dicts — but we still repaint to drop
+        # any mode-specific visual hints (none currently) and keep the
+        # existing balcony-cam pattern of handling mode exits here.
         # Entering / leaving georef: open or close the floating panel + pins
         if mode == "georef" and self._mode != "georef":
             self._open_georef_panel()
@@ -454,6 +545,7 @@ class PlanCanvas(QWidget):
             "apt_type":    Qt.CursorShape.CrossCursor,
             "vertex_edit": Qt.CursorShape.PointingHandCursor,
             "georef":      Qt.CursorShape.CrossCursor,
+            "spring_arm":  Qt.CursorShape.CrossCursor,
         }
         self._view.setCursor(cursors.get(mode, Qt.CursorShape.ArrowCursor))
         hints = {
@@ -463,6 +555,7 @@ class PlanCanvas(QWidget):
             "apt_type":    "Click vertices around one apartment's footprint. Close near first vertex or double-click.",
             "vertex_edit": "Click polygon → drag yellow handles to reshape  |  Ctrl+Click edge → add vertex  |  Alt+Click vertex → delete",
             "georef":      "Click a real-world landmark on the plan, then paste its UE Location in the popup.  Add 2+ landmarks and press Compute → Apply in the panel.",
+            "spring_arm":  "🎥  Click inside a polygon to place its spring-arm cam. Click an existing cam to move it, double-click to edit pitch, Delete to remove.",
         }
         self._set_status(hints.get(mode, ""))
 
@@ -673,6 +766,7 @@ class PlanCanvas(QWidget):
             self._move_orig_pts_list = []
             self._move_orig_centers = []
             self._move_orig_cams_list = []
+            self._move_orig_sa_list = []
             for _k, _i in self._move_targets:
                 _p = (self.apt_type_polygons[_i] if _k == "apt_type"
                       else self.entrances[_i])
@@ -681,6 +775,9 @@ class PlanCanvas(QWidget):
                 self._move_orig_cams_list.append([
                     (c["img_x"], c["img_y"])
                     for c in _migrate_balcony_cams(_p)])
+                _sa_orig = _spring_arm(_p)
+                self._move_orig_sa_list.append(
+                    (_sa_orig["img_x"], _sa_orig["img_y"]) if _sa_orig else None)
             if len(self._move_targets) > 1:
                 self._set_status(
                     f"✥  Dragging group of {len(self._move_targets)} polygons "
@@ -711,6 +808,10 @@ class PlanCanvas(QWidget):
                         self._xform_orig_cams = [
                             (c["img_x"], c["img_y"], c.get("yaw_deg", 0.0))
                             for c in _ocams]
+                        _sa_start = _spring_arm(_p)
+                        self._xform_orig_sa = (
+                            (_sa_start["img_x"], _sa_start["img_y"])
+                            if _sa_start else None)
                         return
             found_kind, found_idx = self._hit_test_polygon(pos)
             if found_kind is not None:
@@ -786,6 +887,34 @@ class PlanCanvas(QWidget):
                 f"({_tp['building_id']}/E{_tp['entrance_id']})  "
                 f"— now click to set camera orientation (ESC to cancel)")
 
+        elif mode == "spring_arm":
+            # Single-click placement. If the click falls on an existing
+            # spring-arm marker we treat that as "pick up & drop here":
+            # the cam for THAT polygon moves to the current cursor. If the
+            # click lands inside a polygon (and not on a cam), we place /
+            # replace that polygon's spring-arm cam. Otherwise fall back
+            # to the nearest polygon by centroid, mirroring balcony cam
+            # UX for consistency.
+            _hit_sa = self._hit_test_spring_arm(pos)
+            if _hit_sa is not None:
+                # Clicking on an existing cam while still inside its own
+                # polygon → move it within the polygon. Clicking a cam
+                # when a *different* polygon is under the cursor also
+                # just moves the original (user expressing "move this
+                # cam to here"), which is rare but harmless.
+                self._set_spring_arm(_hit_sa, pos)
+                return
+            _kind, _idx = self._hit_test_polygon(pos)
+            if _kind == "apt_type" and _idx is not None:
+                _target = _idx
+            else:
+                _target = self._nearest_apt_type_idx(pos)
+                if _target is None:
+                    self._set_status(
+                        "🎥  No apartment polygons — create one first.")
+                    return
+            self._set_spring_arm(_target, pos)
+
         elif mode == "vertex_edit":
             # Check if clicking near an existing handle
             if self._edit_handles:
@@ -857,6 +986,12 @@ class PlanCanvas(QWidget):
                         _ocx2, _ocy2 = _orig_cams[_ci]
                         _cam["img_x"] = _ocx2 + dx
                         _cam["img_y"] = _ocy2 + dy
+                _sa_mv = _spring_arm(p)
+                _orig_sa = (self._move_orig_sa_list[_ti]
+                            if _ti < len(self._move_orig_sa_list) else None)
+                if _sa_mv is not None and _orig_sa is not None:
+                    _sa_mv["img_x"] = _orig_sa[0] + dx
+                    _sa_mv["img_y"] = _orig_sa[1] + dy
                 self._refresh_polygon_visual(kind, idx)
             self._redraw_selection_outlines()
 
@@ -868,6 +1003,8 @@ class PlanCanvas(QWidget):
             _cx, _cy = self._xform_orig_center
             _cams = _migrate_balcony_cams(_p)
             _orig_cams = getattr(self, '_xform_orig_cams', [])
+            _sa_xf = _spring_arm(_p)
+            _orig_sa_xf = getattr(self, '_xform_orig_sa', None)
             if self._xform_drag == 'rot':
                 _sa = math.atan2(self._xform_drag_start.y() - _cy,
                                  self._xform_drag_start.x() - _cx)
@@ -885,6 +1022,15 @@ class PlanCanvas(QWidget):
                         _cam["img_x"] = _cx + (_ocx2 - _cx) * _cos - (_ocy2 - _cy) * _sin
                         _cam["img_y"] = _cy + (_ocx2 - _cx) * _sin + (_ocy2 - _cy) * _cos
                         _cam["yaw_deg"] = round(_oyaw + _d_deg, 1)
+                # SA cam has no intrinsic yaw (yaw is derived from the cam
+                # ↔ centroid vector at spawn time), so we only rotate its
+                # position — the arm visually stays pointed at the
+                # centroid because that centroid also rotates with the
+                # polygon.
+                if _sa_xf is not None and _orig_sa_xf is not None:
+                    _osx, _osy = _orig_sa_xf
+                    _sa_xf["img_x"] = _cx + (_osx - _cx) * _cos - (_osy - _cy) * _sin
+                    _sa_xf["img_y"] = _cy + (_osx - _cx) * _sin + (_osy - _cy) * _cos
             else:
                 _minx, _miny, _maxx, _maxy = self._xform_bbox
                 _anchors = {
@@ -906,6 +1052,10 @@ class PlanCanvas(QWidget):
                         _ocx2, _ocy2, _oyaw = _orig_cams[_ci]
                         _cam["img_x"] = _ax + (_ocx2 - _ax) * _sf
                         _cam["img_y"] = _ay + (_ocy2 - _ay) * _sf
+                if _sa_xf is not None and _orig_sa_xf is not None:
+                    _osx, _osy = _orig_sa_xf
+                    _sa_xf["img_x"] = _ax + (_osx - _ax) * _sf
+                    _sa_xf["img_y"] = _ay + (_osy - _ay) * _sf
             _pts = _p["polygon_img"]
             _p["center_img"] = (
                 sum(pt[0] for pt in _pts) / len(_pts),
@@ -918,12 +1068,14 @@ class PlanCanvas(QWidget):
             _saved_orig_pts   = self._xform_orig_pts
             _saved_orig_ctr   = self._xform_orig_center
             _saved_orig_cams  = getattr(self, '_xform_orig_cams', [])
+            _saved_orig_sa    = getattr(self, '_xform_orig_sa', None)
             self._show_transform_handles(_kind, _idx)
             self._xform_drag        = _saved_drag
             self._xform_drag_start  = _saved_start
             self._xform_orig_pts    = _saved_orig_pts
             self._xform_orig_center = _saved_orig_ctr
             self._xform_orig_cams   = _saved_orig_cams
+            self._xform_orig_sa     = _saved_orig_sa
 
         elif mode == "vertex_edit" and self._drag_handle_idx is not None:
             hi = self._drag_handle_idx
@@ -965,6 +1117,7 @@ class PlanCanvas(QWidget):
             self._move_orig_pts_list = []
             self._move_orig_centers = []
             self._move_orig_cams_list = []
+            self._move_orig_sa_list = []
             s = self.scale_px_per_m
             theta = math.radians(self.north_angle_deg)
             cos_t, sin_t = math.cos(theta), math.sin(theta)
@@ -990,12 +1143,17 @@ class PlanCanvas(QWidget):
                 for _cam in _migrate_balcony_cams(p):
                     _cam["world_x_m"] = round(_cam["img_x"] / s, 3)
                     _cam["world_y_m"] = round(_cam["img_y"] / s, 3)
+                _sa_mv = _spring_arm(p)
+                if _sa_mv is not None:
+                    _sa_mv["world_x_m"] = round(_sa_mv["img_x"] / s, 3)
+                    _sa_mv["world_y_m"] = round(_sa_mv["img_y"] / s, 3)
             self._redraw_overlay()
             self._emit()
 
         elif mode == "transform" and self._xform_drag:
             self._xform_drag = None
             self._xform_orig_cams = []
+            self._xform_orig_sa = None
             if self._xform_target:
                 _kind, _idx = self._xform_target
                 _p = (self.apt_type_polygons[_idx]
@@ -1021,6 +1179,10 @@ class PlanCanvas(QWidget):
                     for _cam in _migrate_balcony_cams(_p):
                         _cam["world_x_m"] = round(_cam["img_x"] / _s, 3)
                         _cam["world_y_m"] = round(_cam["img_y"] / _s, 3)
+                    _sa_xf = _spring_arm(_p)
+                    if _sa_xf is not None:
+                        _sa_xf["world_x_m"] = round(_sa_xf["img_x"] / _s, 3)
+                        _sa_xf["world_y_m"] = round(_sa_xf["img_y"] / _s, 3)
                 if _kind == "apt_type":
                     _p["committed"] = False
                 self._redraw_overlay()
@@ -1056,6 +1218,10 @@ class PlanCanvas(QWidget):
                     for _cam in _migrate_balcony_cams(p):
                         _cam["world_x_m"] = round(_cam["img_x"] / s, 3)
                         _cam["world_y_m"] = round(_cam["img_y"] / s, 3)
+                    _sa_ve = _spring_arm(p)
+                    if _sa_ve is not None:
+                        _sa_ve["world_x_m"] = round(_sa_ve["img_x"] / s, 3)
+                        _sa_ve["world_y_m"] = round(_sa_ve["img_y"] / s, 3)
                 p["committed"] = False
             else:
                 ent = self.entrances[idx]
@@ -1077,7 +1243,21 @@ class PlanCanvas(QWidget):
     def _on_double(self, pos: QPointF):
         if self._mode == "apt_type" and len(self._poly_points) >= 3:
             self._close_apt_polygon()
+        elif self._mode == "spring_arm":
+            # Double-click on a placed SA cam → open pitch dialog. Missed
+            # doubles (no cam under cursor) are ignored so the user can
+            # safely double-click to end a drag-style interaction without
+            # side effects.
+            _hit = self._hit_test_spring_arm(pos)
+            if _hit is not None:
+                self._edit_spring_arm_pitch(_hit)
         elif self._mode == "select":
+            # Select mode double-click priority: SA cam > polygon dialog.
+            # This lets users edit pitch without having to switch modes.
+            _hit_sa = self._hit_test_spring_arm(pos)
+            if _hit_sa is not None:
+                self._edit_spring_arm_pitch(_hit_sa)
+                return
             # Double-click on a polygon in Select mode → re-open properties dialog
             kind, idx = self._hit_test_polygon(pos)
             if kind == "apt_type":
@@ -1379,6 +1559,50 @@ class PlanCanvas(QWidget):
             _ctxt.setZValue(16)
             self._scene.addItem(_ctxt); items.append(_ctxt)
 
+        # ── Spring-arm cam marker + arm line ─────────────────────────────
+        # The arm is drawn as a solid line from polygon centroid to the
+        # cam position (contrast with balcony cam's dashed tether). The
+        # cam marker itself uses the SA palette (_SA_CAM_COLOR) so the
+        # two camera types are visually distinct.
+        _sa = _spring_arm(p)
+        if _sa is not None:
+            _sx, _sy = _sa["img_x"], _sa["img_y"]
+            _eff_pitch = _effective_sa_pitch(p, self._default_sa_pitch_deg)
+            _has_override = _sa.get("pitch_deg") is not None
+            # Arm line: solid, thicker than balcony tether.
+            _arm = self._scene.addLine(
+                QLineF(cx, cy, _sx, _sy),
+                QPen(QColor(_SA_CAM_COLOR), 1.8, Qt.PenStyle.SolidLine))
+            _arm.setZValue(14); items.append(_arm)
+            _sr = 11
+            _sa_circle = self._scene.addEllipse(
+                _sx - _sr, _sy - _sr, _sr * 2, _sr * 2,
+                QPen(QColor(_SA_CAM_COLOR), 2), QBrush(_SA_CAM_FILL))
+            _sa_circle.setZValue(15); items.append(_sa_circle)
+            # Film-camera glyph: small rectangle + lens circle, tinted.
+            _body = self._scene.addRect(
+                _sx - 5, _sy - 3, 10, 6,
+                QPen(QColor(_SA_CAM_COLOR), 1.5),
+                QBrush(_SA_CAM_FILL))
+            _body.setZValue(16); items.append(_body)
+            _lens = self._scene.addEllipse(
+                _sx + 5, _sy - 2, 4, 4,
+                QPen(QColor(_SA_CAM_COLOR), 1.5),
+                QBrush(_SA_CAM_FILL))
+            _lens.setZValue(16); items.append(_lens)
+            # Length readout + pitch annotation (effective value; * suffix
+            # when per-polygon pitch is a custom override).
+            _L_px = math.hypot(_sx - cx, _sy - cy)
+            _L_m = (_L_px / self.scale_px_per_m) if self.scale_px_per_m else None
+            _L_str = f"{_L_m:.1f}m" if _L_m is not None else f"{_L_px:.0f}px"
+            _pitch_tag = f"{_eff_pitch:+.0f}°{'*' if _has_override else ''}"
+            _stxt = _OutlinedTextItem(f"SA  {_L_str}  {_pitch_tag}")
+            _stxt.setFont(QFont("Arial", 7, QFont.Weight.Bold))
+            _sbr = _stxt.boundingRect()
+            _stxt.setPos(_sx - _sbr.width() / 2, _sy + _sr + 1)
+            _stxt.setZValue(16)
+            self._scene.addItem(_stxt); items.append(_stxt)
+
         # Store items
         while len(self._apt_type_items) <= idx:
             self._apt_type_items.append([])
@@ -1430,6 +1654,23 @@ class PlanCanvas(QWidget):
                     best = (ai, ci, d)
         return best[0], best[1]
 
+    def _hit_test_spring_arm(
+        self, pos: QPointF,
+        radius: float = _SA_HIT_RADIUS_PX,
+    ) -> int | None:
+        """Return apt_type idx of the nearest spring-arm cam within
+        ``radius``, or None. Used for click/double-click disambiguation in
+        spring_arm & select modes."""
+        best_i, best_d = None, float("inf")
+        for ai, p in enumerate(self.apt_type_polygons):
+            sa = _spring_arm(p)
+            if sa is None:
+                continue
+            d = math.hypot(pos.x() - sa["img_x"], pos.y() - sa["img_y"])
+            if d < radius and d < best_d:
+                best_i, best_d = ai, d
+        return best_i
+
     def _nearest_apt_type_idx(self, pos: QPointF) -> int | None:
         """Return idx of nearest apt_type polygon (by centroid distance), or None."""
         if not self.apt_type_polygons:
@@ -1457,6 +1698,161 @@ class PlanCanvas(QWidget):
             except Exception:
                 pass
             self._cam_yaw_preview = None
+
+    # ── Spring-arm toolbar handlers ────────────────────────────────────────
+    def _on_default_sa_pitch_changed(self, value: float):
+        """Called whenever the toolbar spinbox value changes.
+
+        Only updates the global default. Per-polygon pitch overrides are
+        preserved. Polygons that rely on the default auto-repaint via
+        ``_redraw_overlay`` (so their label reflects the new effective
+        pitch) and the new default is emitted through calibration so
+        AppData stays in sync for generator baking.
+        """
+        self._default_sa_pitch_deg = float(value)
+        self._redraw_overlay()
+        self.default_sa_pitch_changed.emit(self._default_sa_pitch_deg)
+        self._emit()
+
+    def set_default_sa_pitch(self, value: float):
+        """External setter (e.g. from window.py on load). Does NOT fire
+        back ``default_sa_pitch_changed`` because that would create a
+        loop; signals are blocked on the spinbox during the assignment.
+        """
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = 0.0
+        self._default_sa_pitch_deg = value
+        if self._sa_default_spin is not None:
+            self._sa_default_spin.blockSignals(True)
+            self._sa_default_spin.setValue(value)
+            self._sa_default_spin.blockSignals(False)
+        self._redraw_overlay()
+
+    def _apply_default_sa_pitch_to_all(self):
+        """Stamp the current default pitch onto every placed spring-arm cam.
+
+        Polygons with a per-polygon ``pitch_deg`` override are counted; if
+        any exist the user is asked to confirm before their overrides are
+        discarded. Polygons without a placed spring-arm cam are skipped
+        (nothing to stamp until they're placed).
+        """
+        placed = [p for p in self.apt_type_polygons if _spring_arm(p)]
+        if not placed:
+            self._set_status(
+                "🎥  No spring-arm cams placed yet — nothing to apply to.")
+            return
+        overrides = [p for p in placed
+                     if isinstance(p.get("spring_arm"), dict)
+                     and p["spring_arm"].get("pitch_deg") is not None]
+        if overrides:
+            reply = QMessageBox.question(
+                self, "Overwrite per-polygon pitch?",
+                f"{len(overrides)} polygon(s) have a custom pitch. "
+                f"Apply the default ({self._default_sa_pitch_deg:.1f}°) "
+                f"and discard their overrides?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        stamped = 0
+        for p in placed:
+            sa = p["spring_arm"]
+            sa["pitch_deg"] = float(self._default_sa_pitch_deg)
+            stamped += 1
+        self._redraw_overlay()
+        self._emit()
+        self._set_status(
+            f"🎥  Stamped default pitch "
+            f"({self._default_sa_pitch_deg:.1f}°) on {stamped} polygon(s).")
+
+    def _set_spring_arm(self, apt_idx: int, pos: QPointF):
+        """Place or move polygon ``apt_idx``'s spring-arm cam to ``pos``.
+
+        Preserves any existing per-polygon ``pitch_deg`` override. World
+        coords are back-filled from ``scale_px_per_m`` when available so
+        the generator has everything it needs without requiring an
+        explicit Commit.
+        """
+        if not (0 <= apt_idx < len(self.apt_type_polygons)):
+            return
+        p = self.apt_type_polygons[apt_idx]
+        existing = p.get("spring_arm") if isinstance(p.get("spring_arm"), dict) else {}
+        sa = {
+            "img_x": float(pos.x()),
+            "img_y": float(pos.y()),
+        }
+        # Preserve prior per-polygon pitch override, if any.
+        if "pitch_deg" in existing and existing["pitch_deg"] is not None:
+            sa["pitch_deg"] = float(existing["pitch_deg"])
+        if self.scale_px_per_m:
+            _s = self.scale_px_per_m
+            sa["world_x_m"] = round(pos.x() / _s, 3)
+            sa["world_y_m"] = round(pos.y() / _s, 3)
+        p["spring_arm"] = sa
+        # Re-centre cached geometry (centroid may have drifted) so the
+        # status message reports a length that matches the painted line.
+        _pts = p.get("polygon_img") or []
+        if _pts:
+            _cx = sum(pt[0] for pt in _pts) / len(_pts)
+            _cy = sum(pt[1] for pt in _pts) / len(_pts)
+            p["center_img"] = (_cx, _cy)
+            _L_px = math.hypot(pos.x() - _cx, pos.y() - _cy)
+            _L_m = _L_px / self.scale_px_per_m if self.scale_px_per_m else 0.0
+        else:
+            _L_m = 0.0
+        self._redraw_overlay()
+        self._emit()
+        _pitch = _effective_sa_pitch(p, self._default_sa_pitch_deg)
+        _has_override = "pitch_deg" in sa and sa["pitch_deg"] is not None
+        _src = "custom" if _has_override else "default"
+        self._set_status(
+            f"🎥  SA cam set on {p.get('type_name', '?')} "
+            f"({p.get('building_id', '?')}/E{p.get('entrance_id', '?')})  "
+            f"arm={_L_m:.2f}m  pitch={_pitch:.1f}° ({_src})  "
+            f"— double-click cam to edit pitch")
+
+    def _edit_spring_arm_pitch(self, apt_idx: int):
+        """Open the per-polygon spring-arm pitch dialog for polygon
+        ``apt_idx``. Supports removing the polygon's SA cam altogether
+        from the same dialog (trash button) — mirrors balcony-cam UX
+        where click-on-cam removes it.
+        """
+        if not (0 <= apt_idx < len(self.apt_type_polygons)):
+            return
+        p = self.apt_type_polygons[apt_idx]
+        sa = _spring_arm(p)
+        if sa is None:
+            return
+        dlg = _SpringArmPitchDialog(
+            self,
+            current=sa.get("pitch_deg"),
+            default_value=self._default_sa_pitch_deg,
+            type_label=(f"{p.get('type_name', '?')}  "
+                        f"({p.get('building_id', '?')}/"
+                        f"E{p.get('entrance_id', '?')})"),
+        )
+        result = dlg.exec()
+        if result == QDialog.DialogCode.Rejected:
+            return
+        action, value = dlg.result_values()
+        if action == "delete":
+            p.pop("spring_arm", None)
+            self._redraw_overlay()
+            self._emit()
+            self._set_status(f"🎥  Removed SA cam from {p.get('type_name', '?')}")
+            return
+        if action == "use_default":
+            sa.pop("pitch_deg", None)
+        elif action == "custom":
+            sa["pitch_deg"] = float(value)
+        self._redraw_overlay()
+        self._emit()
+        _eff = _effective_sa_pitch(p, self._default_sa_pitch_deg)
+        _src = "custom" if sa.get("pitch_deg") is not None else "default"
+        self._set_status(
+            f"🎥  {p.get('type_name', '?')} pitch={_eff:.1f}° ({_src})")
 
     def _hit_test_polygon(self, pos: QPointF):
         """Return (kind, idx) of first polygon hit, or (None, None)."""
@@ -1957,6 +2353,7 @@ class PlanCanvas(QWidget):
             "north_angle_deg":   self.north_angle_deg,
             "entrances":         self.entrances,
             "apt_type_polygons": self.apt_type_polygons,
+            "default_spring_arm_pitch_deg": self._default_sa_pitch_deg,
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -1976,6 +2373,10 @@ class PlanCanvas(QWidget):
         self.north_angle_deg  = data.get("north_angle_deg", 0.0)
         self.entrances        = data.get("entrances", [])
         self.apt_type_polygons = data.get("apt_type_polygons", [])
+        # Restore the default SA pitch through the setter so the
+        # toolbar spinbox also updates.
+        self.set_default_sa_pitch(
+            data.get("default_spring_arm_pitch_deg", 0.0))
 
         # Rebuild color map from loaded polygons (Feature 1 fix)
         self._type_color_map = {}
@@ -2025,6 +2426,7 @@ class PlanCanvas(QWidget):
             "north_angle_deg":   self.north_angle_deg,
             "entrances":         self.entrances,
             "apt_type_polygons": self.apt_type_polygons,
+            "default_spring_arm_pitch_deg": self._default_sa_pitch_deg,
         }
 
     # ── Auto-Place ─────────────────────────────────────────────────────────
@@ -2472,6 +2874,10 @@ class PlanCanvas(QWidget):
                     cam["world_x_m"] = round(cam["img_x"] / s, 3)
                     cam["world_y_m"] = round(cam["img_y"] / s, 3)
                     cam["z_cm"] = z_cm
+            _sa_bf = _spring_arm(p)
+            if _sa_bf is not None:
+                _sa_bf["world_x_m"] = round(_sa_bf["img_x"] / s, 3)
+                _sa_bf["world_y_m"] = round(_sa_bf["img_y"] / s, 3)
             p["committed"] = True
             n += 1
         theta = math.radians(self.north_angle_deg)
@@ -2512,6 +2918,10 @@ class PlanCanvas(QWidget):
                 cam["world_x_m"] = round(cam["img_x"] / s, 3)
                 cam["world_y_m"] = round(cam["img_y"] / s, 3)
                 cam["z_cm"] = z_cm
+            _sa_cp = _spring_arm(p)
+            if _sa_cp is not None:
+                _sa_cp["world_x_m"] = round(_sa_cp["img_x"] / s, 3)
+                _sa_cp["world_y_m"] = round(_sa_cp["img_y"] / s, 3)
         p["committed"] = True
         self._redraw_overlay()
         self._emit()
@@ -2910,3 +3320,119 @@ class _BulkHeightDialog(QDialog):
 
     def result_values(self) -> tuple[float, bool]:
         return self._height.value(), self._apply_to_type.isChecked()
+
+
+class _SpringArmPitchDialog(QDialog):
+    """Edit one polygon's spring-arm pitch (or delete the cam outright).
+
+    Shows an intuitive pitch slider (+ = camera UP), a "Use default"
+    checkbox (clears the per-polygon override so the global default
+    takes over), the current effective value, and a delete button.
+
+    ``result_values()`` returns one of:
+        ("custom",       float_value)  — user set an explicit pitch
+        ("use_default",  None)         — user cleared the override
+        ("delete",       None)         — user wants the SA cam removed
+    Only valid when ``exec()`` returned ``Accepted``.
+    """
+
+    def __init__(self, parent, current: float | None,
+                 default_value: float, type_label: str):
+        from PyQt6.QtWidgets import QSlider  # local import: only needed here
+        super().__init__(parent)
+        self.setWindowTitle("Spring-Arm Pitch")
+        self.setModal(True)
+        self.setMinimumWidth(360)
+
+        self._default_value = float(default_value)
+        self._current = current  # None == "use default"
+        self._result_action: str = "use_default"
+        self._result_value: float | None = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        layout.addWidget(QLabel(
+            f"<b>{type_label}</b>"
+            "<br><span style='color:#888'>Positive pitch = camera tilts UP.</span>"))
+
+        self._use_default = QCheckBox(
+            f"Use global default ({self._default_value:.1f}°)")
+        self._use_default.setChecked(current is None)
+        layout.addWidget(self._use_default)
+
+        # Pitch slider + spinbox combo — changing either updates the other.
+        # QSlider is int-only, so we use tenths-of-a-degree under the hood
+        # and divide by 10 for display.
+        row = QHBoxLayout()
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(int(_SA_PITCH_MIN * 10), int(_SA_PITCH_MAX * 10))
+        self._slider.setSingleStep(1)
+        self._slider.setPageStep(50)
+        self._spin = QDoubleSpinBox()
+        self._spin.setRange(_SA_PITCH_MIN, _SA_PITCH_MAX)
+        self._spin.setSingleStep(0.5)
+        self._spin.setDecimals(1)
+        self._spin.setSuffix("°")
+        self._spin.setFixedWidth(80)
+        _seed = float(current) if current is not None else self._default_value
+        self._slider.setValue(int(round(_seed * 10)))
+        self._spin.setValue(_seed)
+
+        def _slider_to_spin(v: int):
+            self._spin.blockSignals(True)
+            self._spin.setValue(v / 10.0)
+            self._spin.blockSignals(False)
+
+        def _spin_to_slider(v: float):
+            self._slider.blockSignals(True)
+            self._slider.setValue(int(round(v * 10)))
+            self._slider.blockSignals(False)
+
+        self._slider.valueChanged.connect(_slider_to_spin)
+        self._spin.valueChanged.connect(_spin_to_slider)
+        row.addWidget(self._slider, 1)
+        row.addWidget(self._spin)
+        layout.addLayout(row)
+
+        def _on_use_default(checked: bool):
+            self._slider.setEnabled(not checked)
+            self._spin.setEnabled(not checked)
+
+        self._use_default.toggled.connect(_on_use_default)
+        _on_use_default(self._use_default.isChecked())
+
+        btns = QHBoxLayout()
+        btn_del = QPushButton("🗑  Remove cam")
+        btn_del.setToolTip(
+            "Delete this polygon's spring-arm cam placement. The BP's "
+            "SpringArm stays but won't be positioned by the generator.")
+        btn_del.clicked.connect(self._accept_delete)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton("Apply  ↵")
+        ok.setDefault(True)
+        ok.clicked.connect(self._accept_apply)
+        btns.addWidget(btn_del)
+        btns.addStretch(1)
+        btns.addWidget(cancel)
+        btns.addWidget(ok)
+        layout.addLayout(btns)
+
+    def _accept_apply(self):
+        if self._use_default.isChecked():
+            self._result_action = "use_default"
+            self._result_value = None
+        else:
+            self._result_action = "custom"
+            self._result_value = float(self._spin.value())
+        self.accept()
+
+    def _accept_delete(self):
+        self._result_action = "delete"
+        self._result_value = None
+        self.accept()
+
+    def result_values(self) -> tuple[str, float | None]:
+        return self._result_action, self._result_value

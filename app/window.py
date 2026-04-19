@@ -85,6 +85,14 @@ class MainWindow(QMainWindow):
 
     def _on_calibration_changed(self, cal: dict):
         self._data.calibration = cal
+        # Keep AppData's default SA pitch in sync so generator bakes the
+        # correct DEFAULT_SA_PITCH_DEG regardless of whether the user
+        # nudged the toolbar spinbox or loaded a calibration JSON.
+        try:
+            self._data.default_spring_arm_pitch_deg = float(
+                cal.get("default_spring_arm_pitch_deg", 0.0))
+        except (TypeError, ValueError):
+            self._data.default_spring_arm_pitch_deg = 0.0
         self._refresh_coverage()
 
     def _refresh_coverage(self):
